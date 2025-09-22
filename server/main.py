@@ -1,11 +1,16 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 import whisper
 import openai
 import os
 import tempfile
 import base64
+import warnings
+import json
 from dotenv import load_dotenv
+
+# Suppress Whisper FP16 warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="whisper")
 
 load_dotenv()
 
@@ -74,42 +79,52 @@ async def root():
     return {"message": "RapidAnswer API is running!"}
 
 
-@app.post("/process-voice")
-async def process_voice(audio: UploadFile = File(...)):
-    """
-    Complete pipeline: transcribe -> chat -> TTS
-    """
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    print("WebSocket connection established")
+
     try:
-        print(f"Starting voice processing for file: {audio.filename}")
+        while True:
+            # Receive message from client
+            message = await websocket.receive_text()
+            data = json.loads(message)
 
-        # Read uploaded audio file
-        audio_data = await audio.read()
-        print(f"Read {len(audio_data)} bytes of audio data")
+            if data["type"] == "process_voice":
+                print("Processing voice message via WebSocket")
 
-        # Step 1: Transcribe audio to text
-        print("Starting transcription...")
-        transcription = transcribe_audio_internal(audio_data)
-        print(f"Transcription result: {transcription}")
+                # Decode base64 audio data
+                audio_data = base64.b64decode(data["audio_data"])
+                print(f"Received {len(audio_data)} bytes of audio data")
 
-        # Step 2: Get AI response
-        print("Getting AI response...")
-        ai_response = get_ai_response_internal(transcription)
-        print(f"AI response: {ai_response}")
+                # Step 1: Transcribe audio to text
+                print("Starting transcription...")
+                transcription = transcribe_audio_internal(audio_data)
+                print(f"Transcription result: {transcription}")
 
-        # Step 3: Convert response to speech
-        print("Converting to speech...")
-        audio_base64 = synthesize_speech_internal(ai_response)
-        print("Speech synthesis complete")
+                # Step 2: Get AI response
+                print("Getting AI response...")
+                ai_response = get_ai_response_internal(transcription)
+                print(f"AI response: {ai_response}")
 
-        return {
-            "transcription": transcription,
-            "ai_response": ai_response,
-            "audio": audio_base64
-        }
+                # Step 3: Convert response to speech
+                print("Converting to speech...")
+                audio_base64 = synthesize_speech_internal(ai_response)
+                print("Speech synthesis complete")
+
+                # Send response back to client
+                response = {
+                    "type": "voice_response",
+                    "transcription": transcription,
+                    "ai_response": ai_response,
+                    "audio": audio_base64
+                }
+
+                await websocket.send_text(json.dumps(response))
 
     except Exception as e:
-        print(f"Error in voice processing: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Voice processing failed: {str(e)}")
+        print(f"WebSocket error: {str(e)}")
+        await websocket.close()
 
 
 if __name__ == "__main__":
