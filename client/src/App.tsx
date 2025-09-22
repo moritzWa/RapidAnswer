@@ -55,17 +55,10 @@ function App() {
     channels: number
   ) => {
     try {
-      console.log("Playing PCM chunk:", {
-        sampleRate,
-        channels,
-        dataLength: pcmBase64.length,
-      });
-
       // Initialize playback AudioContext if needed
       if (!playbackContextRef.current) {
         playbackContextRef.current = new AudioContext({ sampleRate });
         nextPlayTimeRef.current = playbackContextRef.current.currentTime;
-        console.log("Created AudioContext with sample rate:", sampleRate);
       }
 
       const context = playbackContextRef.current;
@@ -73,15 +66,7 @@ function App() {
       // Resume AudioContext if suspended (required in modern browsers)
       if (context.state === "suspended") {
         await context.resume();
-        console.log("AudioContext resumed");
       }
-
-      console.log(
-        "AudioContext state:",
-        context.state,
-        "currentTime:",
-        context.currentTime
-      );
 
       // Decode base64 PCM data
       const pcmData = atob(pcmBase64);
@@ -92,12 +77,6 @@ function App() {
 
       // Convert bytes to 16-bit integers
       const samples = new Int16Array(pcmArray.buffer);
-      console.log(
-        "Decoded samples:",
-        samples.length,
-        "first few:",
-        samples.slice(0, 10)
-      );
 
       // Create AudioBuffer
       const audioBuffer = context.createBuffer(
@@ -112,12 +91,6 @@ function App() {
         channelData[i] = samples[i] / 32768.0;
       }
 
-      console.log("AudioBuffer created:", {
-        duration: audioBuffer.duration,
-        length: audioBuffer.length,
-        sampleRate: audioBuffer.sampleRate,
-      });
-
       // Calculate chunk duration at normal speed
       const chunkDurationSeconds = samples.length / sampleRate;
 
@@ -129,12 +102,6 @@ function App() {
 
       // Schedule playback at the precise next time
       const startTime = Math.max(context.currentTime, nextPlayTimeRef.current);
-      console.log(
-        "Scheduling playback at:",
-        startTime,
-        "duration:",
-        chunkDurationSeconds
-      );
 
       source.start(startTime);
 
@@ -163,7 +130,6 @@ function App() {
     const ws = new WebSocket("ws://localhost:8000/ws");
 
     ws.onopen = () => {
-      console.log("WebSocket connected");
       setError(null);
     };
 
@@ -251,7 +217,6 @@ function App() {
     };
 
     ws.onclose = (event) => {
-      console.log("WebSocket disconnected", event.code, event.reason);
       setRecordingState("idle");
 
       // Reconnect after 2 seconds if not a normal closure
@@ -375,11 +340,9 @@ function App() {
       }
 
       // Load test PCM audio data
-      const response = await fetch('/eval_data/test.pcm');
+      const response = await fetch("/eval_data/test.pcm");
       const testPCMBuffer = await response.arrayBuffer();
       const pcmArray = new Int16Array(testPCMBuffer);
-
-      console.log(`Sending test audio: ${pcmArray.length} samples`);
 
       // Send the test audio data in chunks (simulate real recording)
       const chunkSize = 1600; // Same as real recording (100ms at 16kHz)
