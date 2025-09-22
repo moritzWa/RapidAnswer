@@ -1,16 +1,13 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-import whisper
 import openai
 import os
-import tempfile
 import base64
-import warnings
 import json
+import asyncio
+import websockets
+import ssl
 from dotenv import load_dotenv
-
-# Suppress Whisper FP16 warnings
-warnings.filterwarnings("ignore", category=UserWarning, module="whisper")
 
 load_dotenv()
 
@@ -28,38 +25,109 @@ app.add_middleware(
 # Initialize OpenAI client
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# Load Whisper model (using base model for faster processing)
-whisper_model = whisper.load_model("base")
+# Deepgram configuration
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+DEEPGRAM_URL = "wss://api.deepgram.com/v1/listen"
 
 
-def transcribe_audio_internal(audio_data: bytes) -> str:
+async def transcribe_audio_deepgram_streaming(audio_data: bytes, websocket: WebSocket) -> str:
     """
-    Transcribe audio data to text using OpenAI Whisper
+    Transcribe audio data to text using Deepgram with real-time streaming
     """
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
-        temp_audio.write(audio_data)
-        temp_audio_path = temp_audio.name
+    # Use linear16 PCM format for raw audio data
+    uri = f"{DEEPGRAM_URL}?model=nova-2&smart_format=true&encoding=linear16&sample_rate=16000&channels=1&interim_results=true"
+
+    final_transcript = ""
 
     try:
-        result = whisper_model.transcribe(temp_audio_path)
-        return result["text"]
-    finally:
-        os.unlink(temp_audio_path)
+        # Create SSL context for secure connection
+        ssl_context = ssl.create_default_context()
+
+        # Create WebSocket connection with SSL and authorization
+        async with websockets.connect(
+            uri,
+            additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
+            ssl=ssl_context
+        ) as ws:
+            # Send audio data
+            await ws.send(audio_data)
+
+            # Send close stream signal
+            await ws.send(json.dumps({"type": "CloseStream"}))
+
+            # Receive transcription
+            async for message in ws:
+                data = json.loads(message)
+
+                # Handle interim results for real-time feedback
+                if data.get("type") == "Results":
+                    transcript = data.get("channel", {}).get("alternatives", [{}])[0].get("transcript", "")
+
+                    if transcript:
+                        if data.get("is_final"):
+                            final_transcript += transcript + " "
+                        else:
+                            # Send interim result to client
+                            interim_response = {
+                                "type": "interim_transcription",
+                                "text": transcript
+                            }
+                            await websocket.send_text(json.dumps(interim_response))
+
+    except Exception as e:
+        print(f"Deepgram error: {e}")
+        # Raise exception instead of returning error message
+        raise Exception(f"Transcription failed: {e}")
+
+    if not final_transcript.strip():
+        raise Exception("No transcription received")
+
+    return final_transcript.strip()
 
 
-def get_ai_response_internal(text: str) -> str:
+async def get_ai_response_streaming(text: str, websocket: WebSocket) -> str:
     """
-    Get AI response from OpenAI API
+    Get AI response from OpenAI API with streaming
     """
-    response = openai.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant. Keep responses conversational and concise."},
-            {"role": "user", "content": text}
-        ],
-        max_tokens=150
-    )
-    return response.choices[0].message.content
+    full_response = ""
+
+    try:
+        stream = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant. Keep responses conversational and concise."},
+                {"role": "user", "content": text}
+            ],
+            max_tokens=150,
+            stream=True
+        )
+
+        for chunk in stream:
+            if chunk.choices[0].delta.content is not None:
+                content = chunk.choices[0].delta.content
+                full_response += content
+
+                # Send streaming response to client
+                stream_response = {
+                    "type": "ai_response_stream",
+                    "content": content,
+                    "is_complete": False
+                }
+                await websocket.send_text(json.dumps(stream_response))
+
+        # Send completion signal
+        completion_response = {
+            "type": "ai_response_stream",
+            "content": "",
+            "is_complete": True
+        }
+        await websocket.send_text(json.dumps(completion_response))
+
+    except Exception as e:
+        print(f"OpenAI streaming error: {e}")
+        raise Exception(f"AI response generation failed: {e}")
+
+    return full_response
 
 
 def synthesize_speech_internal(text: str) -> str:
@@ -84,47 +152,85 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print("WebSocket connection established")
 
+    audio_buffer = bytearray()
+
     try:
         while True:
-            # Receive message from client
-            message = await websocket.receive_text()
-            data = json.loads(message)
+            # Handle both binary (audio) and text (control) messages
+            try:
+                message = await websocket.receive()
+            except Exception as e:
+                print(f"WebSocket receive error: {e}")
+                break
 
-            if data["type"] == "process_voice":
-                print("Processing voice message via WebSocket")
+            # Check if client disconnected
+            if message["type"] == "websocket.disconnect":
+                print("Client disconnected")
+                break
 
-                # Decode base64 audio data
-                audio_data = base64.b64decode(data["audio_data"])
-                print(f"Received {len(audio_data)} bytes of audio data")
+            if message["type"] == "websocket.receive":
+                if "bytes" in message:
+                    # Binary audio chunk
+                    audio_chunk = message["bytes"]
+                    audio_buffer.extend(audio_chunk)
+                    print(f"Received audio chunk: {len(audio_chunk)} bytes, total: {len(audio_buffer)}")
 
-                # Step 1: Transcribe audio to text
-                print("Starting transcription...")
-                transcription = transcribe_audio_internal(audio_data)
-                print(f"Transcription result: {transcription}")
+                elif "text" in message:
+                    # JSON control message
+                    data = json.loads(message["text"])
 
-                # Step 2: Get AI response
-                print("Getting AI response...")
-                ai_response = get_ai_response_internal(transcription)
-                print(f"AI response: {ai_response}")
+                    if data["type"] == "user_audio_end":
+                        print("Audio stream ended, processing...")
 
-                # Step 3: Convert response to speech
-                print("Converting to speech...")
-                audio_base64 = synthesize_speech_internal(ai_response)
-                print("Speech synthesis complete")
+                        if len(audio_buffer) > 0:
+                            # Process complete audio buffer
+                            print(f"Processing {len(audio_buffer)} bytes of audio data")
 
-                # Send response back to client
-                response = {
-                    "type": "voice_response",
-                    "transcription": transcription,
-                    "ai_response": ai_response,
-                    "audio": audio_base64
-                }
+                            try:
+                                # Step 1: Transcribe audio to text
+                                print("Starting transcription...")
+                                transcription = await transcribe_audio_deepgram_streaming(bytes(audio_buffer), websocket)
+                                print(f"Transcription result: {transcription}")
 
-                await websocket.send_text(json.dumps(response))
+                                # Step 2: Get AI response with streaming
+                                print("Getting AI response...")
+                                ai_response = await get_ai_response_streaming(transcription, websocket)
+                                print(f"AI response: {ai_response}")
+
+                                # Step 3: Convert response to speech
+                                print("Converting to speech...")
+                                audio_base64 = synthesize_speech_internal(ai_response)
+                                print("Speech synthesis complete")
+
+                                # Send final response back to client
+                                response = {
+                                    "type": "voice_response",
+                                    "transcription": transcription,
+                                    "ai_response": ai_response,
+                                    "audio": audio_base64
+                                }
+
+                                await websocket.send_text(json.dumps(response))
+
+                            except Exception as processing_error:
+                                print(f"Processing error: {processing_error}")
+                                # Send error to client instead of continuing
+                                error_response = {
+                                    "type": "error",
+                                    "message": str(processing_error)
+                                }
+                                await websocket.send_text(json.dumps(error_response))
+
+                            # Clear buffer for next recording
+                            audio_buffer.clear()
 
     except Exception as e:
         print(f"WebSocket error: {str(e)}")
-        await websocket.close()
+        try:
+            if websocket.client_state.value == 1:  # OPEN state
+                await websocket.close()
+        except:
+            pass
 
 
 if __name__ == "__main__":

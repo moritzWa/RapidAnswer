@@ -1,169 +1,258 @@
-import React, { useState, useRef, useCallback } from 'react'
-import './App.css'
+import React, { useState, useRef, useCallback } from "react";
+import "./App.css";
 
 interface ChatMessage {
-  type: 'user' | 'assistant'
-  content: string
-  timestamp: Date
+  type: "user" | "assistant";
+  content: string;
+  timestamp: Date;
 }
 
-type RecordingState = 'idle' | 'recording' | 'processing'
+interface InterimMessage {
+  type: "interim";
+  content: string;
+}
+
+type RecordingState = "idle" | "recording" | "processing";
 
 function App() {
-  const [recordingState, setRecordingState] = useState<RecordingState>('idle')
-  const [messages, setMessages] = useState<ChatMessage[]>([])
-  const [error, setError] = useState<string | null>(null)
+  const [recordingState, setRecordingState] = useState<RecordingState>("idle");
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [interimMessage, setInterimMessage] = useState<InterimMessage | null>(
+    null
+  );
+  const [streamingResponse, setStreamingResponse] = useState<string>("");
+  const [error, setError] = useState<string | null>(null);
 
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
-  const chunksRef = useRef<Blob[]>([])
-  const wsRef = useRef<WebSocket | null>(null)
+  const wsRef = useRef<WebSocket | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+
+  // Send raw PCM data directly
+  const sendPCMData = (pcmData: Int16Array) => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      console.warn("WebSocket not connected, reconnecting...");
+      initWebSocket();
+      return;
+    }
+
+    wsRef.current.send(pcmData.buffer);
+  };
 
   // Initialize WebSocket connection
   const initWebSocket = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return
+    if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
-    const ws = new WebSocket('ws://localhost:8000/ws')
+    const ws = new WebSocket("ws://localhost:8000/ws");
 
     ws.onopen = () => {
-      console.log('WebSocket connected')
-    }
+      console.log("WebSocket connected");
+      setError(null);
+    };
 
     ws.onmessage = (event) => {
-      const data = JSON.parse(event.data)
+      const data = JSON.parse(event.data);
 
-      if (data.type === 'voice_response') {
+      if (data.type === "interim_transcription") {
+        // Show interim transcription in real-time
+        setInterimMessage({
+          type: "interim",
+          content: data.text,
+        });
+      } else if (data.type === "ai_response_stream") {
+        if (data.is_complete) {
+          // Streaming response complete
+          setStreamingResponse("");
+        } else {
+          // Append streaming content
+          setStreamingResponse((prev) => prev + data.content);
+        }
+      } else if (data.type === "voice_response") {
+        // Clear interim message and streaming response
+        setInterimMessage(null);
+        setStreamingResponse("");
+
         // Add user message (transcription)
-        setMessages(prev => [...prev, {
-          type: 'user',
-          content: data.transcription,
-          timestamp: new Date()
-        }])
+        setMessages((prev) => [
+          ...prev,
+          {
+            type: "user",
+            content: data.transcription,
+            timestamp: new Date(),
+          },
+        ]);
 
         // Add assistant response
-        setMessages(prev => [...prev, {
-          type: 'assistant',
-          content: data.ai_response,
-          timestamp: new Date()
-        }])
+        setMessages((prev) => [
+          ...prev,
+          {
+            type: "assistant",
+            content: data.ai_response,
+            timestamp: new Date(),
+          },
+        ]);
 
         // Play audio response
         if (data.audio) {
-          const audioData = atob(data.audio)
-          const audioArray = new Uint8Array(audioData.length)
+          const audioData = atob(data.audio);
+          const audioArray = new Uint8Array(audioData.length);
           for (let i = 0; i < audioData.length; i++) {
-            audioArray[i] = audioData.charCodeAt(i)
+            audioArray[i] = audioData.charCodeAt(i);
           }
-          const audioBlob = new Blob([audioArray], { type: 'audio/mpeg' })
-          const audioUrl = URL.createObjectURL(audioBlob)
-          const audio = new Audio(audioUrl)
-          audio.play()
+          const audioBlob = new Blob([audioArray], { type: "audio/mpeg" });
+          const audioUrl = URL.createObjectURL(audioBlob);
+          const audio = new Audio(audioUrl);
+          audio.play();
         }
 
-        setRecordingState('idle')
+        setRecordingState("idle");
+      } else if (data.type === "error") {
+        // Handle server errors
+        setError(data.message);
+        setRecordingState("idle");
+        setInterimMessage(null);
+        setStreamingResponse("");
       }
-    }
+    };
 
     ws.onerror = (error) => {
-      console.error('WebSocket error:', error)
-      setError('Connection error')
-    }
+      console.error("WebSocket error:", error);
+      setError("Connection error");
+      setRecordingState("idle");
+    };
 
-    ws.onclose = () => {
-      console.log('WebSocket disconnected')
-    }
+    ws.onclose = (event) => {
+      console.log("WebSocket disconnected", event.code, event.reason);
+      setRecordingState("idle");
 
-    wsRef.current = ws
-  }, [])
+      // Reconnect after 2 seconds if not a normal closure
+      if (event.code !== 1000) {
+        setTimeout(() => {
+          if (wsRef.current?.readyState !== WebSocket.OPEN) {
+            initWebSocket();
+          }
+        }, 2000);
+      }
+    };
+
+    wsRef.current = ws;
+  }, []);
 
   const startRecording = useCallback(async () => {
-    if (recordingState !== 'idle') return
+    if (recordingState !== "idle") return;
 
     try {
-      setError(null)
-      setRecordingState('recording')
+      setError(null);
+      setRecordingState("recording");
 
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           sampleRate: 16000,
           channelCount: 1,
           echoCancellation: true,
-          noiseSuppression: true
-        }
-      })
+          noiseSuppression: true,
+        },
+      });
 
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: 'audio/webm;codecs=opus'
-      })
-
-      mediaRecorderRef.current = mediaRecorder
-      chunksRef.current = []
-
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          chunksRef.current.push(event.data)
-        }
+      // Initialize AudioContext for direct PCM capture
+      if (!audioContextRef.current) {
+        audioContextRef.current = new AudioContext({ sampleRate: 16000 });
       }
 
-      mediaRecorder.onstop = async () => {
-        const audioBlob = new Blob(chunksRef.current, { type: 'audio/webm' })
+      // Create audio source from stream
+      const source = audioContextRef.current.createMediaStreamSource(stream);
+      sourceRef.current = source;
 
-        // Stop all tracks to free up the microphone
-        stream.getTracks().forEach(track => track.stop())
+      // Create script processor for PCM data
+      const processor = audioContextRef.current.createScriptProcessor(
+        4096,
+        1,
+        1
+      );
+      processorRef.current = processor;
 
-        // Process the audio
-        await processAudio(audioBlob)
-      }
+      let pcmBuffer: number[] = [];
 
-      mediaRecorder.start()
+      processor.onaudioprocess = (event) => {
+        const inputBuffer = event.inputBuffer;
+        const inputData = inputBuffer.getChannelData(0);
+
+        // Accumulate PCM data
+        for (let i = 0; i < inputData.length; i++) {
+          pcmBuffer.push(inputData[i]);
+        }
+
+        // Send data every ~100ms (1600 samples at 16kHz)
+        if (pcmBuffer.length >= 1600) {
+          // Convert float32 to int16
+          const pcm16 = new Int16Array(pcmBuffer.length);
+          for (let i = 0; i < pcmBuffer.length; i++) {
+            pcm16[i] = Math.max(-32768, Math.min(32767, pcmBuffer[i] * 32767));
+          }
+
+          sendPCMData(pcm16);
+          pcmBuffer = [];
+        }
+      };
+
+      // Connect audio processing pipeline
+      source.connect(processor);
+      processor.connect(audioContextRef.current.destination);
     } catch (err) {
-      setError(`Failed to start recording: ${err instanceof Error ? err.message : 'Unknown error'}`)
-      setRecordingState('idle')
+      setError(
+        `Failed to start recording: ${
+          err instanceof Error ? err.message : "Unknown error"
+        }`
+      );
+      setRecordingState("idle");
     }
-  }, [recordingState])
+  }, [recordingState]);
 
   const stopRecording = useCallback(() => {
-    if (mediaRecorderRef.current && recordingState === 'recording') {
-      mediaRecorderRef.current.stop()
-      setRecordingState('processing')
-    }
-  }, [recordingState])
-
-  const processAudio = async (audioBlob: Blob) => {
-    try {
-      // Ensure WebSocket is connected
-      initWebSocket()
-
-      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-        throw new Error('WebSocket not connected')
+    if (recordingState === "recording") {
+      // Clean up audio processing
+      if (processorRef.current) {
+        processorRef.current.disconnect();
+        processorRef.current = null;
       }
 
-      // Convert audio blob to base64
-      const arrayBuffer = await audioBlob.arrayBuffer()
-      const base64Audio = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)))
-
-      // Send audio data via WebSocket
-      const message = {
-        type: 'process_voice',
-        audio_data: base64Audio
+      if (sourceRef.current) {
+        sourceRef.current.disconnect();
+        sourceRef.current = null;
       }
 
-      wsRef.current.send(JSON.stringify(message))
+      // Send end-of-stream signal
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: "user_audio_end" }));
+      }
 
-    } catch (err) {
-      setError(`Failed to process audio: ${err instanceof Error ? err.message : 'Unknown error'}`)
-      setRecordingState('idle')
+      setRecordingState("processing");
     }
-  }
+  }, [recordingState]);
 
   // Initialize WebSocket on component mount
   React.useEffect(() => {
-    initWebSocket()
+    initWebSocket();
     return () => {
+      // Cleanup WebSocket
       if (wsRef.current) {
-        wsRef.current.close()
+        wsRef.current.close();
       }
-    }
-  }, [])
+
+      // Cleanup audio processing
+      if (processorRef.current) {
+        processorRef.current.disconnect();
+      }
+
+      if (sourceRef.current) {
+        sourceRef.current.disconnect();
+      }
+
+      if (audioContextRef.current) {
+        audioContextRef.current.close();
+      }
+    };
+  }, []);
 
   return (
     <div className="app">
@@ -173,41 +262,59 @@ function App() {
       <div className="chat-container">
         {messages.map((message, index) => (
           <div key={index} className={`message ${message.type}`}>
-            <strong>{message.type === 'user' ? 'You' : 'Assistant'}:</strong>
+            <strong>{message.type === "user" ? "You" : "Assistant"}:</strong>
             <div>{message.content}</div>
             <small>{message.timestamp.toLocaleTimeString()}</small>
           </div>
         ))}
 
-        {recordingState === 'processing' && (
-          <div className="message assistant">
-            <strong>Assistant:</strong>
-            <div>Processing...</div>
+        {interimMessage && (
+          <div className="message interim">
+            <strong>You (transcribing...):</strong>
+            <div>{interimMessage.content}</div>
           </div>
         )}
+
+        {streamingResponse && (
+          <div className="message assistant streaming">
+            <strong>Assistant:</strong>
+            <div>{streamingResponse}</div>
+          </div>
+        )}
+
+        {recordingState === "processing" &&
+          !interimMessage &&
+          !streamingResponse && (
+            <div className="message assistant">
+              <strong>Assistant:</strong>
+              <div>Processing...</div>
+            </div>
+          )}
       </div>
 
       <div className="controls">
         <button
           type="button"
-          className={`record-button ${recordingState === 'recording' ? 'recording' : ''}`}
+          className={`record-button ${
+            recordingState === "recording" ? "recording" : ""
+          }`}
           onMouseDown={startRecording}
           onMouseUp={stopRecording}
           onTouchStart={startRecording}
           onTouchEnd={stopRecording}
-          disabled={recordingState === 'processing'}
+          disabled={recordingState === "processing"}
         >
-          {recordingState === 'recording' ? 'Recording...' :
-           recordingState === 'processing' ? 'Processing...' :
-           'Hold to Speak'}
+          {recordingState === "recording"
+            ? "Recording..."
+            : recordingState === "processing"
+            ? "Processing..."
+            : "Hold to Speak"}
         </button>
 
-        {error && (
-          <div className="error">{error}</div>
-        )}
+        {error && <div className="error">{error}</div>}
       </div>
     </div>
-  )
+  );
 }
 
-export default App
+export default App;

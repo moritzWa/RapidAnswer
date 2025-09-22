@@ -2,5 +2,6 @@ fastapi>=0.100.0
 uvicorn[standard]>=0.20.0
 python-multipart>=0.0.6
 openai>=1.0.0
-openai-whisper
 python-dotenv>=1.0.0
+websockets>=12.0
+deepgram-sdk>=3.0.0

@@ -67,6 +67,12 @@ button:focus-visible {
   }
 }
 
-.message {
-  color: #213547;
+@media (prefers-color-scheme: dark) {
+  .message {
+    color: #213547;
+  }
+
+  .message.interim {
+    color: #b5c2ce;
+  }
 }
