@@ -21,12 +21,30 @@ function App() {
     null
   );
   const [streamingResponse, setStreamingResponse] = useState<string>("");
+  const [streamingAudio, setStreamingAudio] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+
+  // Helper function to play audio from base64
+  const playAudioFromBase64 = (audioBase64: string) => {
+    try {
+      const audioData = atob(audioBase64);
+      const audioArray = new Uint8Array(audioData.length);
+      for (let i = 0; i < audioData.length; i++) {
+        audioArray[i] = audioData.charCodeAt(i);
+      }
+      const audioBlob = new Blob([audioArray], { type: "audio/mpeg" });
+      const audioUrl = URL.createObjectURL(audioBlob);
+      const audio = new Audio(audioUrl);
+      audio.play();
+    } catch (error) {
+      console.error("Error playing audio:", error);
+    }
+  };
 
   // Send raw PCM data directly
   const sendPCMData = (pcmData: Int16Array) => {
@@ -67,6 +85,16 @@ function App() {
           // Append streaming content
           setStreamingResponse((prev) => prev + data.content);
         }
+      } else if (data.type === "audio_stream") {
+        if (data.is_final) {
+          // Audio streaming complete, play the accumulated audio
+          const completeAudio = streamingAudio + data.audio_chunk;
+          playAudioFromBase64(completeAudio);
+          setStreamingAudio("");
+        } else {
+          // Accumulate audio chunks
+          setStreamingAudio((prev) => prev + data.audio_chunk);
+        }
       } else if (data.type === "voice_response") {
         // Clear interim message and streaming response
         setInterimMessage(null);
@@ -92,17 +120,9 @@ function App() {
           },
         ]);
 
-        // Play audio response
+        // Play audio response (fallback for non-streaming)
         if (data.audio) {
-          const audioData = atob(data.audio);
-          const audioArray = new Uint8Array(audioData.length);
-          for (let i = 0; i < audioData.length; i++) {
-            audioArray[i] = audioData.charCodeAt(i);
-          }
-          const audioBlob = new Blob([audioArray], { type: "audio/mpeg" });
-          const audioUrl = URL.createObjectURL(audioBlob);
-          const audio = new Audio(audioUrl);
-          audio.play();
+          playAudioFromBase64(data.audio);
         }
 
         setRecordingState("idle");
@@ -112,6 +132,7 @@ function App() {
         setRecordingState("idle");
         setInterimMessage(null);
         setStreamingResponse("");
+        setStreamingAudio("");
       }
     };
 

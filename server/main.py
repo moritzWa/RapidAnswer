@@ -98,7 +98,6 @@ async def get_ai_response_streaming(text: str, websocket: WebSocket) -> str:
                 {"role": "system", "content": "You are a helpful assistant. Keep responses conversational and concise."},
                 {"role": "user", "content": text}
             ],
-            max_tokens=150,
             stream=True
         )
 
@@ -130,16 +129,40 @@ async def get_ai_response_streaming(text: str, websocket: WebSocket) -> str:
     return full_response
 
 
-def synthesize_speech_internal(text: str) -> str:
+async def synthesize_speech_streaming(text: str, websocket: WebSocket) -> str:
     """
-    Convert text to speech using OpenAI TTS and return base64 encoded audio
+    Convert text to speech using OpenAI TTS with 2x speed and stream audio back
     """
-    response = openai.audio.speech.create(
-        model="tts-1",
-        voice="alloy",
-        input=text
-    )
-    return base64.b64encode(response.content).decode('utf-8')
+    try:
+        response = openai.audio.speech.create(
+            model="tts-1",
+            voice="alloy",
+            input=text,
+            speed=2.0  # 2x speed as requested
+        )
+
+        # Get audio content
+        audio_content = response.content
+        audio_base64 = base64.b64encode(audio_content).decode('utf-8')
+
+        # Send audio chunks in smaller pieces for streaming
+        chunk_size = 8192  # 8KB chunks
+        for i in range(0, len(audio_base64), chunk_size):
+            chunk = audio_base64[i:i + chunk_size]
+            is_final = i + chunk_size >= len(audio_base64)
+
+            stream_response = {
+                "type": "audio_stream",
+                "audio_chunk": chunk,
+                "is_final": is_final
+            }
+            await websocket.send_text(json.dumps(stream_response))
+
+        return audio_base64
+
+    except Exception as e:
+        print(f"TTS streaming error: {e}")
+        raise Exception(f"Speech synthesis failed: {e}")
 
 
 @app.get("/")
@@ -197,9 +220,9 @@ async def websocket_endpoint(websocket: WebSocket):
                                 ai_response = await get_ai_response_streaming(transcription, websocket)
                                 print(f"AI response: {ai_response}")
 
-                                # Step 3: Convert response to speech
+                                # Step 3: Convert response to speech with streaming
                                 print("Converting to speech...")
-                                audio_base64 = synthesize_speech_internal(ai_response)
+                                audio_base64 = await synthesize_speech_streaming(ai_response, websocket)
                                 print("Speech synthesis complete")
 
                                 # Send final response back to client
