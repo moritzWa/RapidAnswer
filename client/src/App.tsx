@@ -28,8 +28,11 @@ function App() {
   const audioContextRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const playbackContextRef = useRef<AudioContext | null>(null);
+  const playbackQueueRef = useRef<Array<{pcmBase64: string, sampleRate: number, channels: number}>>([]);
+  const nextPlayTimeRef = useRef<number>(0);
 
-  // Helper function to play audio from base64
+  // Helper function to play audio from base64 (fallback)
   const playAudioFromBase64 = (audioBase64: string) => {
     try {
       const audioData = atob(audioBase64);
@@ -43,6 +46,77 @@ function App() {
       audio.play();
     } catch (error) {
       console.error("Error playing audio:", error);
+    }
+  };
+
+  // Schedule PCM chunk for precise 2x speed playback using Web Audio API timing
+  const playPCMChunkScheduled = async (pcmBase64: string, sampleRate: number, channels: number) => {
+    try {
+      console.log("Playing PCM chunk:", { sampleRate, channels, dataLength: pcmBase64.length });
+
+      // Initialize playback AudioContext if needed
+      if (!playbackContextRef.current) {
+        playbackContextRef.current = new AudioContext({ sampleRate });
+        nextPlayTimeRef.current = playbackContextRef.current.currentTime;
+        console.log("Created AudioContext with sample rate:", sampleRate);
+      }
+
+      const context = playbackContextRef.current;
+
+      // Resume AudioContext if suspended (required in modern browsers)
+      if (context.state === 'suspended') {
+        await context.resume();
+        console.log("AudioContext resumed");
+      }
+
+      console.log("AudioContext state:", context.state, "currentTime:", context.currentTime);
+
+      // Decode base64 PCM data
+      const pcmData = atob(pcmBase64);
+      const pcmArray = new Uint8Array(pcmData.length);
+      for (let i = 0; i < pcmData.length; i++) {
+        pcmArray[i] = pcmData.charCodeAt(i);
+      }
+
+      // Convert bytes to 16-bit integers
+      const samples = new Int16Array(pcmArray.buffer);
+      console.log("Decoded samples:", samples.length, "first few:", samples.slice(0, 10));
+
+      // Create AudioBuffer
+      const audioBuffer = context.createBuffer(channels, samples.length, sampleRate);
+      const channelData = audioBuffer.getChannelData(0);
+
+      // Convert int16 to float32 and copy to AudioBuffer
+      for (let i = 0; i < samples.length; i++) {
+        channelData[i] = samples[i] / 32768.0;
+      }
+
+      console.log("AudioBuffer created:", {
+        duration: audioBuffer.duration,
+        length: audioBuffer.length,
+        sampleRate: audioBuffer.sampleRate
+      });
+
+      // Calculate chunk duration at normal speed
+      const chunkDurationSeconds = samples.length / sampleRate;
+
+      // Create buffer source (OpenAI already generated at 2x speed)
+      const source = context.createBufferSource();
+      source.buffer = audioBuffer;
+      source.playbackRate.value = 1.0; // Normal playback - OpenAI already did 2x speed
+      source.connect(context.destination);
+
+      // Schedule playback at the precise next time
+      const startTime = Math.max(context.currentTime, nextPlayTimeRef.current);
+      console.log("Scheduling playback at:", startTime, "duration:", chunkDurationSeconds);
+
+      source.start(startTime);
+
+      // Update next play time (normal duration since OpenAI already compressed to 2x)
+      nextPlayTimeRef.current = startTime + chunkDurationSeconds;
+
+    } catch (error) {
+      console.error("Error playing PCM chunk:", error);
     }
   };
 
@@ -68,7 +142,7 @@ function App() {
       setError(null);
     };
 
-    ws.onmessage = (event) => {
+    ws.onmessage = async (event) => {
       const data = JSON.parse(event.data);
 
       if (data.type === "interim_transcription") {
@@ -85,14 +159,19 @@ function App() {
           // Append streaming content
           setStreamingResponse((prev) => prev + data.content);
         }
+      } else if (data.type === "audio_stream_pcm") {
+        // Schedule PCM chunk for precise 2x speed playback
+        if (data.pcm_chunk) {
+          await playPCMChunkScheduled(data.pcm_chunk, data.sample_rate, data.channels);
+        }
       } else if (data.type === "audio_stream") {
         if (data.is_final) {
-          // Audio streaming complete, play the accumulated audio
+          // Audio streaming complete, play the accumulated audio (fallback)
           const completeAudio = streamingAudio + data.audio_chunk;
           playAudioFromBase64(completeAudio);
           setStreamingAudio("");
         } else {
-          // Accumulate audio chunks
+          // Accumulate audio chunks (fallback)
           setStreamingAudio((prev) => prev + data.audio_chunk);
         }
       } else if (data.type === "voice_response") {
@@ -271,6 +350,11 @@ function App() {
 
       if (audioContextRef.current) {
         audioContextRef.current.close();
+      }
+
+      // Cleanup playback context
+      if (playbackContextRef.current) {
+        playbackContextRef.current.close();
       }
     };
   }, []);
