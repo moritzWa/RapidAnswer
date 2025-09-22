@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback } from "react";
+import React, { useCallback, useRef, useState } from "react";
 import "./App.css";
 
 interface ChatMessage {
@@ -29,7 +29,6 @@ function App() {
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const playbackContextRef = useRef<AudioContext | null>(null);
-  const playbackQueueRef = useRef<Array<{pcmBase64: string, sampleRate: number, channels: number}>>([]);
   const nextPlayTimeRef = useRef<number>(0);
 
   // Helper function to play audio from base64 (fallback)
@@ -50,9 +49,17 @@ function App() {
   };
 
   // Schedule PCM chunk for precise 2x speed playback using Web Audio API timing
-  const playPCMChunkScheduled = async (pcmBase64: string, sampleRate: number, channels: number) => {
+  const playPCMChunkScheduled = async (
+    pcmBase64: string,
+    sampleRate: number,
+    channels: number
+  ) => {
     try {
-      console.log("Playing PCM chunk:", { sampleRate, channels, dataLength: pcmBase64.length });
+      console.log("Playing PCM chunk:", {
+        sampleRate,
+        channels,
+        dataLength: pcmBase64.length,
+      });
 
       // Initialize playback AudioContext if needed
       if (!playbackContextRef.current) {
@@ -64,12 +71,17 @@ function App() {
       const context = playbackContextRef.current;
 
       // Resume AudioContext if suspended (required in modern browsers)
-      if (context.state === 'suspended') {
+      if (context.state === "suspended") {
         await context.resume();
         console.log("AudioContext resumed");
       }
 
-      console.log("AudioContext state:", context.state, "currentTime:", context.currentTime);
+      console.log(
+        "AudioContext state:",
+        context.state,
+        "currentTime:",
+        context.currentTime
+      );
 
       // Decode base64 PCM data
       const pcmData = atob(pcmBase64);
@@ -80,10 +92,19 @@ function App() {
 
       // Convert bytes to 16-bit integers
       const samples = new Int16Array(pcmArray.buffer);
-      console.log("Decoded samples:", samples.length, "first few:", samples.slice(0, 10));
+      console.log(
+        "Decoded samples:",
+        samples.length,
+        "first few:",
+        samples.slice(0, 10)
+      );
 
       // Create AudioBuffer
-      const audioBuffer = context.createBuffer(channels, samples.length, sampleRate);
+      const audioBuffer = context.createBuffer(
+        channels,
+        samples.length,
+        sampleRate
+      );
       const channelData = audioBuffer.getChannelData(0);
 
       // Convert int16 to float32 and copy to AudioBuffer
@@ -94,7 +115,7 @@ function App() {
       console.log("AudioBuffer created:", {
         duration: audioBuffer.duration,
         length: audioBuffer.length,
-        sampleRate: audioBuffer.sampleRate
+        sampleRate: audioBuffer.sampleRate,
       });
 
       // Calculate chunk duration at normal speed
@@ -108,13 +129,17 @@ function App() {
 
       // Schedule playback at the precise next time
       const startTime = Math.max(context.currentTime, nextPlayTimeRef.current);
-      console.log("Scheduling playback at:", startTime, "duration:", chunkDurationSeconds);
+      console.log(
+        "Scheduling playback at:",
+        startTime,
+        "duration:",
+        chunkDurationSeconds
+      );
 
       source.start(startTime);
 
       // Update next play time (normal duration since OpenAI already compressed to 2x)
       nextPlayTimeRef.current = startTime + chunkDurationSeconds;
-
     } catch (error) {
       console.error("Error playing PCM chunk:", error);
     }
@@ -162,7 +187,11 @@ function App() {
       } else if (data.type === "audio_stream_pcm") {
         // Schedule PCM chunk for precise 2x speed playback
         if (data.pcm_chunk) {
-          await playPCMChunkScheduled(data.pcm_chunk, data.sample_rate, data.channels);
+          await playPCMChunkScheduled(
+            data.pcm_chunk,
+            data.sample_rate,
+            data.channels
+          );
         }
       } else if (data.type === "audio_stream") {
         if (data.is_final) {
@@ -330,6 +359,53 @@ function App() {
     }
   }, [recordingState]);
 
+  // Test function with hardcoded audio data
+  const testWithHardcodedAudio = useCallback(async () => {
+    if (recordingState !== "idle") return;
+
+    try {
+      setError(null);
+      setRecordingState("recording");
+
+      // Initialize WebSocket if needed
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+        initWebSocket();
+        // Wait a bit for connection
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+
+      // Load test PCM audio data
+      const response = await fetch('/eval_data/test.pcm');
+      const testPCMBuffer = await response.arrayBuffer();
+      const pcmArray = new Int16Array(testPCMBuffer);
+
+      console.log(`Sending test audio: ${pcmArray.length} samples`);
+
+      // Send the test audio data in chunks (simulate real recording)
+      const chunkSize = 1600; // Same as real recording (100ms at 16kHz)
+      for (let i = 0; i < pcmArray.length; i += chunkSize) {
+        const chunk = pcmArray.slice(i, i + chunkSize);
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(chunk.buffer);
+          // Small delay to simulate real-time recording
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+      }
+
+      // Send end-of-stream signal
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: "user_audio_end" }));
+      }
+
+      setRecordingState("processing");
+    } catch (err) {
+      setError(
+        `Test failed: ${err instanceof Error ? err.message : "Unknown error"}`
+      );
+      setRecordingState("idle");
+    }
+  }, [recordingState, initWebSocket]);
+
   // Initialize WebSocket on component mount
   React.useEffect(() => {
     initWebSocket();
@@ -414,6 +490,15 @@ function App() {
             : recordingState === "processing"
             ? "Processing..."
             : "Hold to Speak"}
+        </button>
+
+        <button
+          type="button"
+          className="test-button"
+          onClick={testWithHardcodedAudio}
+          disabled={recordingState === "processing"}
+        >
+          Dev: Test Input
         </button>
 
         {error && <div className="error">{error}</div>}

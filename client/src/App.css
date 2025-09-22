@@ -50,6 +50,22 @@
   cursor: not-allowed;
 }
 
+.test-button {
+  padding: 10px 20px;
+  font-size: 14px;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+  background-color: #ff9800;
+  color: white;
+  margin-left: 10px;
+}
+
+.test-button:disabled {
+  background-color: #ccc;
+  cursor: not-allowed;
+}
+
 .error {
   color: red;
   margin-top: 10px;

@@ -87,11 +87,32 @@ async def transcribe_audio_deepgram_streaming(audio_data: bytes, websocket: WebS
     return final_transcript.strip()
 
 
-async def get_ai_response_streaming(text: str, websocket: WebSocket) -> str:
+async def get_ai_response_with_sentence_streaming(text: str, websocket: WebSocket) -> str:
     """
-    Get AI response from OpenAI API with streaming
+    Get AI response from OpenAI API with sentence-by-sentence TTS streaming
     """
     full_response = ""
+    sentence_buffer = ""
+    tts_tasks = []
+    audio_queue = asyncio.Queue()
+
+    # The first sentence doesn't have to wait for anything.
+    previous_sentence_done = asyncio.Event()
+    previous_sentence_done.set()
+
+    async def audio_sender():
+        """Get audio chunks from queue and send to client."""
+        while True:
+            chunk = await audio_queue.get()
+            if chunk is None:
+                # Sentinel value received, stop sending
+                audio_queue.task_done()
+                break
+            await websocket.send_text(json.dumps(chunk))
+            audio_queue.task_done()
+
+    # Start the dedicated audio sender task
+    sender_task = asyncio.create_task(audio_sender())
 
     try:
         stream = openai.chat.completions.create(
@@ -107,6 +128,7 @@ async def get_ai_response_streaming(text: str, websocket: WebSocket) -> str:
             if chunk.choices[0].delta.content is not None:
                 content = chunk.choices[0].delta.content
                 full_response += content
+                sentence_buffer += content
 
                 # Send streaming response to client
                 stream_response = {
@@ -116,7 +138,31 @@ async def get_ai_response_streaming(text: str, websocket: WebSocket) -> str:
                 }
                 await websocket.send_text(json.dumps(stream_response))
 
-        # Send completion signal
+                # Check if we have a complete sentence
+                if any(punct in content for punct in ['.', '!', '?']):
+                    # Found sentence-ending punctuation
+                    complete_sentence = sentence_buffer.strip()
+                    if len(complete_sentence) > 5:  # Only process meaningful sentences
+                        print(f"🎵 Starting TTS for sentence: {complete_sentence}")
+
+                        # This event will be set when the current sentence is done.
+                        current_sentence_done = asyncio.Event()
+
+                        # Start TTS, passing the gates for ordering.
+                        task = asyncio.create_task(synthesize_speech_streaming(
+                            text=complete_sentence,
+                            audio_queue=audio_queue,
+                            wait_for_event=previous_sentence_done,
+                            set_event_when_done=current_sentence_done
+                        ))
+                        tts_tasks.append(task)
+
+                        # The next sentence will wait for this one to be done.
+                        previous_sentence_done = current_sentence_done
+
+                    sentence_buffer = ""  # Reset buffer
+
+        # Send completion signal for the text stream
         completion_response = {
             "type": "ai_response_stream",
             "content": "",
@@ -124,16 +170,42 @@ async def get_ai_response_streaming(text: str, websocket: WebSocket) -> str:
         }
         await websocket.send_text(json.dumps(completion_response))
 
+        # Handle any remaining text in buffer
+        if sentence_buffer.strip():
+            print(f"🎵 Starting TTS for final fragment: {sentence_buffer.strip()}")
+            current_sentence_done = asyncio.Event()
+            task = asyncio.create_task(synthesize_speech_streaming(
+                text=sentence_buffer.strip(),
+                audio_queue=audio_queue,
+                wait_for_event=previous_sentence_done,
+                set_event_when_done=current_sentence_done
+            ))
+            tts_tasks.append(task)
+
+        # Wait for all TTS tasks to complete before returning
+        if tts_tasks:
+            await asyncio.gather(*tts_tasks)
+
     except Exception as e:
         print(f"OpenAI streaming error: {e}")
         raise Exception(f"AI response generation failed: {e}")
+    finally:
+        # Signal the sender to stop and wait for it to finish
+        await audio_queue.put(None)
+        await sender_task
 
     return full_response
 
 
-async def synthesize_speech_streaming(text: str, websocket: WebSocket) -> str:
+async def synthesize_speech_streaming(
+    text: str,
+    audio_queue: asyncio.Queue,
+    wait_for_event: asyncio.Event,
+    set_event_when_done: asyncio.Event
+) -> None:
     """
-    Convert text to speech using OpenAI's real-time streaming TTS API
+    Convert text to speech using OpenAI's streaming TTS API and put chunks in a queue,
+    respecting an event chain for ordering.
     """
     try:
         # Use AsyncOpenAI client for streaming response
@@ -144,14 +216,12 @@ async def synthesize_speech_streaming(text: str, websocket: WebSocket) -> str:
             speed=2.0,  # 2x speed as requested
             response_format="pcm"  # Raw PCM for lowest latency
         ) as response:
-
-            complete_audio = bytearray()
+            # Wait for the previous sentence's audio to be fully queued.
+            await wait_for_event.wait()
 
             # Stream audio chunks as they're generated by OpenAI
             async for chunk in response.iter_bytes(chunk_size=4096):
                 if chunk:
-                    complete_audio.extend(chunk)
-
                     # Send PCM chunk immediately for real-time playback
                     stream_response = {
                         "type": "audio_stream_pcm",
@@ -160,9 +230,26 @@ async def synthesize_speech_streaming(text: str, websocket: WebSocket) -> str:
                         "channels": 1,
                         "is_final": False
                     }
-                    await websocket.send_text(json.dumps(stream_response))
+                    await audio_queue.put(stream_response)
 
-            # Send final signal
+            # Add a 200ms silent audio chunk for a natural pause
+            sample_rate = 24000
+            duration = 0.2  # 200ms
+            sample_width = 2  # 16-bit PCM
+            num_samples = int(sample_rate * duration)
+            num_bytes = num_samples * sample_width
+            silent_chunk = b'\x00' * num_bytes
+
+            silent_response = {
+                "type": "audio_stream_pcm",
+                "pcm_chunk": base64.b64encode(silent_chunk).decode('utf-8'),
+                "sample_rate": sample_rate,
+                "channels": 1,
+                "is_final": False
+            }
+            await audio_queue.put(silent_response)
+
+            # Send final signal for the sentence
             final_response = {
                 "type": "audio_stream_pcm",
                 "pcm_chunk": "",
@@ -170,13 +257,15 @@ async def synthesize_speech_streaming(text: str, websocket: WebSocket) -> str:
                 "channels": 1,
                 "is_final": True
             }
-            await websocket.send_text(json.dumps(final_response))
-
-            return base64.b64encode(complete_audio).decode('utf-8')
+            await audio_queue.put(final_response)
 
     except Exception as e:
         print(f"TTS streaming error: {e}")
-        raise Exception(f"Speech synthesis failed: {e}")
+        # We don't re-raise here to avoid crashing the entire process
+        # The client will simply not receive audio for this sentence.
+    finally:
+        # Signal that this sentence is done, allowing the next one to proceed.
+        set_event_when_done.set()
 
 
 @app.get("/")
@@ -229,22 +318,20 @@ async def websocket_endpoint(websocket: WebSocket):
                                 transcription = await transcribe_audio_deepgram_streaming(bytes(audio_buffer), websocket)
                                 print(f"Transcription result: {transcription}")
 
-                                # Step 2: Get AI response with streaming
-                                print("Getting AI response...")
-                                ai_response = await get_ai_response_streaming(transcription, websocket)
-                                print(f"AI response: {ai_response}")
+                                # Step 2: Get AI response with sentence-by-sentence TTS streaming
+                                print("Getting AI response with sentence streaming...")
+                                ai_response = await get_ai_response_with_sentence_streaming(transcription, websocket)
+                                print(f"AI response complete: {ai_response}")
 
-                                # Step 3: Convert response to speech with streaming
-                                print("Converting to speech...")
-                                audio_base64 = await synthesize_speech_streaming(ai_response, websocket)
-                                print("Speech synthesis complete")
+                                # Note: TTS is now handled within the AI response function
+                                print("All TTS streaming complete")
 
-                                # Send final response back to client
+                                # Send final response back to client (audio already streamed)
                                 response = {
                                     "type": "voice_response",
                                     "transcription": transcription,
                                     "ai_response": ai_response,
-                                    "audio": audio_base64
+                                    "audio": ""  # Audio was already streamed sentence-by-sentence
                                 }
 
                                 await websocket.send_text(json.dumps(response))
