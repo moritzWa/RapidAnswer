@@ -373,6 +373,7 @@ function App() {
   React.useEffect(() => {
     initWebSocket();
     return () => {
+      console.log("Cleaning up WebSocket connection");
       // Cleanup WebSocket
       if (wsRef.current) {
         wsRef.current.close();
