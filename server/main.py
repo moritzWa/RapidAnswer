@@ -64,12 +64,69 @@ async def handle_ai_response(transcription: str, client_websocket: WebSocket):
         await client_websocket.send_text(json.dumps(error_response))
 
 
+async def manage_audio_queue(audio_queue: asyncio.Queue, websocket: WebSocket):
+    """Send audio chunks from queue to client"""
+    while True:
+        chunk = await audio_queue.get()
+        if chunk is None:
+            # Sentinel value received, stop sending
+            audio_queue.task_done()
+            break
+        await websocket.send_text(json.dumps(chunk))
+        audio_queue.task_done()
+
+
+async def stream_openai_response(text: str, websocket: WebSocket, sentence_handler):
+    """Stream AI response and detect complete sentences"""
+    full_response = ""
+    sentence_buffer = ""
+
+    stream = openai.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant. Keep responses conversational and concise."},
+            {"role": "user", "content": text}
+        ],
+        stream=True
+    )
+
+    for chunk in stream:
+        if chunk.choices[0].delta.content is not None:
+            content = chunk.choices[0].delta.content
+            full_response += content
+            sentence_buffer += content
+
+            # Send streaming response to client
+            stream_response = {
+                "type": "ai_response_stream",
+                "content": content,
+                "is_complete": False
+            }
+            await websocket.send_text(json.dumps(stream_response))
+
+            # Check if we have a complete sentence
+            if any(punct in content for punct in ['.', '!', '?']):
+                # Found sentence-ending punctuation
+                complete_sentence = sentence_buffer.strip()
+                if len(complete_sentence) > 5:  # Only process meaningful sentences
+                    await sentence_handler(complete_sentence)
+                sentence_buffer = ""  # Reset buffer
+
+    # Send completion signal for the text stream
+    completion_response = {
+        "type": "ai_response_stream",
+        "content": "",
+        "is_complete": True
+    }
+    await websocket.send_text(json.dumps(completion_response))
+
+    return full_response, sentence_buffer
+
+
 async def get_ai_response_with_sentence_streaming(text: str, websocket: WebSocket) -> str:
     """
     Get AI response from OpenAI API with sentence-by-sentence TTS streaming
     """
-    full_response = ""
-    sentence_buffer = ""
     tts_tasks = []
     audio_queue = asyncio.Queue()
 
@@ -77,87 +134,37 @@ async def get_ai_response_with_sentence_streaming(text: str, websocket: WebSocke
     previous_sentence_done = asyncio.Event()
     previous_sentence_done.set()
 
-    async def audio_sender():
-        """Get audio chunks from queue and send to client."""
-        while True:
-            chunk = await audio_queue.get()
-            if chunk is None:
-                # Sentinel value received, stop sending
-                audio_queue.task_done()
-                break
-            await websocket.send_text(json.dumps(chunk))
-            audio_queue.task_done()
-
     # Start the dedicated audio sender task
-    sender_task = asyncio.create_task(audio_sender())
+    sender_task = asyncio.create_task(manage_audio_queue(audio_queue, websocket))
+
+    async def handle_sentence(sentence):
+        """Process a complete sentence for TTS"""
+        nonlocal previous_sentence_done
+        print(f"🎵 Starting TTS for sentence: {sentence}")
+
+        # This event will be set when the current sentence is done.
+        current_sentence_done = asyncio.Event()
+
+        # Start TTS, passing the gates for ordering.
+        task = asyncio.create_task(synthesize_speech_streaming(
+            text=sentence,
+            audio_queue=audio_queue,
+            wait_for_event=previous_sentence_done,
+            set_event_when_done=current_sentence_done
+        ))
+        tts_tasks.append(task)
+
+        # The next sentence will wait for this one to be done.
+        previous_sentence_done = current_sentence_done
 
     try:
-        stream = openai.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant. Keep responses conversational and concise."},
-                {"role": "user", "content": text}
-            ],
-            stream=True
-        )
-
-        for chunk in stream:
-            if chunk.choices[0].delta.content is not None:
-                content = chunk.choices[0].delta.content
-                full_response += content
-                sentence_buffer += content
-
-                # Send streaming response to client
-                stream_response = {
-                    "type": "ai_response_stream",
-                    "content": content,
-                    "is_complete": False
-                }
-                await websocket.send_text(json.dumps(stream_response))
-
-                # Check if we have a complete sentence
-                if any(punct in content for punct in ['.', '!', '?']):
-                    # Found sentence-ending punctuation
-                    complete_sentence = sentence_buffer.strip()
-                    if len(complete_sentence) > 5:  # Only process meaningful sentences
-                        print(f"🎵 Starting TTS for sentence: {complete_sentence}")
-
-                        # This event will be set when the current sentence is done.
-                        current_sentence_done = asyncio.Event()
-
-                        # Start TTS, passing the gates for ordering.
-                        task = asyncio.create_task(synthesize_speech_streaming(
-                            text=complete_sentence,
-                            audio_queue=audio_queue,
-                            wait_for_event=previous_sentence_done,
-                            set_event_when_done=current_sentence_done
-                        ))
-                        tts_tasks.append(task)
-
-                        # The next sentence will wait for this one to be done.
-                        previous_sentence_done = current_sentence_done
-
-                    sentence_buffer = ""  # Reset buffer
-
-        # Send completion signal for the text stream
-        completion_response = {
-            "type": "ai_response_stream",
-            "content": "",
-            "is_complete": True
-        }
-        await websocket.send_text(json.dumps(completion_response))
+        # Stream response and handle sentences
+        full_response, remaining_buffer = await stream_openai_response(text, websocket, handle_sentence)
 
         # Handle any remaining text in buffer
-        if sentence_buffer.strip():
-            print(f"🎵 Starting TTS for final fragment: {sentence_buffer.strip()}")
-            current_sentence_done = asyncio.Event()
-            task = asyncio.create_task(synthesize_speech_streaming(
-                text=sentence_buffer.strip(),
-                audio_queue=audio_queue,
-                wait_for_event=previous_sentence_done,
-                set_event_when_done=current_sentence_done
-            ))
-            tts_tasks.append(task)
+        if remaining_buffer.strip():
+            print(f"🎵 Starting TTS for final fragment: {remaining_buffer.strip()}")
+            await handle_sentence(remaining_buffer.strip())
 
         # Wait for all TTS tasks to complete before returning
         if tts_tasks:
