@@ -9,7 +9,7 @@ async def create_deepgram_connection(deepgram_url: str, api_key: str):
     """
     Create a WebSocket connection to Deepgram for real-time transcription
     """
-    uri = f"{deepgram_url}?model=nova-2&smart_format=true&encoding=linear16&sample_rate=16000&channels=1&interim_results=true"
+    uri = f"{deepgram_url}?model=nova-2&smart_format=true&encoding=linear16&sample_rate=16000&channels=1&interim_results=true&endpointing=false"
 
     try:
         ssl_context = ssl.create_default_context()
@@ -24,91 +24,50 @@ async def create_deepgram_connection(deepgram_url: str, api_key: str):
         raise Exception(f"Failed to connect to Deepgram: {e}")
 
 
-async def handle_deepgram_messages(deepgram_websocket, client_websocket, ai_response_handler):
+async def handle_deepgram_messages(deepgram_websocket, client_websocket):
     """
-    Handle incoming messages from Deepgram WebSocket and forward to client
+    Handle incoming messages from Deepgram WebSocket, forward interim results,
+    and return the final transcript.
     """
-    final_transcript = ""
-    session_completed = False  # Flag to prevent processing multiple final results
+    full_transcript = ""
+    session_completed = False
 
     try:
         async for message in deepgram_websocket:
             data = json.loads(message)
 
             if data.get("type") == "Results":
-                # Deepgram sends alternatives ranked by confidence (best first)
                 alternatives = data.get("channel", {}).get("alternatives", [])
-
                 if alternatives:
-                    # Use the most confident transcription
-                    first_alt = alternatives[0]
-                    transcript = first_alt.get("transcript", "")
-                    confidence = first_alt.get("confidence", "N/A")
-
-                    # Only log meaningful transcripts or issues
-                    if transcript or data.get("is_final"):
-                        print(f"🔍 {'FINAL' if data.get('is_final') else 'Interim'}: '{transcript}' (confidence: {confidence})")
-
-                if transcript:
-                    if data.get("is_final"):
-                        if session_completed:
-                            # Deepgram sometimes sends additional empty finals after real transcription
-                            print(f"🔄 Ignoring additional final result after session completed")
-                            continue
-
-                        session_completed = True  # Mark session as completed
-
-                        # Accumulate final transcript for AI response
-                        final_transcript += transcript + " "
-
-                        # Trigger AI response with complete transcript
-                        if final_transcript.strip():
-                            print(f"Final transcription: {final_transcript.strip()}")
-                            await ai_response_handler(final_transcript.strip(), client_websocket)
-
-                            # Reset for next turn
-                            final_transcript = ""
-
-                    else:
-                        # Forward interim result to client immediately
-                        interim_response = {
-                            "type": "interim_transcription",
-                            "text": transcript
-                        }
-                        await client_websocket.send_text(json.dumps(interim_response))
-                else:
-                    if data.get("is_final"):
-                        if session_completed:
-                            print(f"🔄 Ignoring additional empty final result after session completed")
-                            continue
-
-                        session_completed = True  # Mark session as completed
-
-                        print(f"⚠️ FINAL result received but transcript is empty! Sending fallback message to AI")
-                        # Send fallback message to AI instead of hanging
-                        await ai_response_handler("[AUDIO_UNCLEAR]", client_websocket)
-
-                        # Reset for next turn
-                        final_transcript = ""
-                    else:
-                        print(f"⚠️ Interim result received but transcript is empty")
-            else:
-                # Only log non-Results if it's not just metadata
-                if data.get("type") != "Metadata":
-                    print(f"🔍 Non-Results message type: {data.get('type')}")
+                    transcript = alternatives[0].get("transcript", "")
+                    if transcript:
+                        if data.get("is_final"):
+                            full_transcript += transcript + " "
+                            # Don't send final transcript to AI here; wait for client signal
+                        else:
+                            # Forward interim result to client immediately
+                            interim_response = {
+                                "type": "interim_transcription",
+                                "text": transcript
+                            }
+                            await client_websocket.send_text(json.dumps(interim_response))
 
     except Exception as e:
         print(f"Deepgram message handling error: {e}")
-        # Don't send error to client for normal connection closures
-        if "1000" not in str(e):
-            error_response = {
-                "type": "error",
-                "message": f"Transcription error: {e}"
-            }
-            try:
-                await client_websocket.send_text(json.dumps(error_response))
-            except:
-                pass
+        error_response = {
+            "type": "error",
+            "message": f"Transcription error: {e}"
+        }
+        try:
+            await client_websocket.send_text(json.dumps(error_response))
+        except Exception as send_error:
+            print(f"Failed to send error response: {send_error}")
+
+    # If the session completes but we have no transcript, it was likely unclear audio
+    if not full_transcript.strip():
+        return "[AUDIO_UNCLEAR]"
+
+    return full_transcript.strip()
 
 
 async def send_close_stream(deepgram_websocket):

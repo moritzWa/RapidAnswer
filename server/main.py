@@ -305,27 +305,10 @@ async def websocket_endpoint(client_websocket: WebSocket):
 
     deepgram_websocket = None
     deepgram_task = None
+    final_transcript = "" # Variable to store the final transcript
 
-    async def cleanup_deepgram():
-        """Clean up Deepgram connection after AI processing completes"""
-        nonlocal deepgram_websocket, deepgram_task
-        if deepgram_websocket:
-            try:
-                await deepgram_websocket.close()
-                print("🔄 Deepgram connection closed, ready for next turn")
-            except Exception as close_error:
-                print(f"⚠️  Error closing Deepgram: {close_error}")
-            finally:
-                deepgram_websocket = None
-
-        if deepgram_task:
-            deepgram_task.cancel()
-            try:
-                await deepgram_task
-            except asyncio.CancelledError:
-                print("🛑 Deepgram task cancelled for next turn")
-            finally:
-                deepgram_task = None
+    # No longer needed as we'll handle cleanup directly
+    # async def cleanup_deepgram(): ...
 
     try:
         while True:
@@ -354,8 +337,7 @@ async def websocket_endpoint(client_websocket: WebSocket):
                             deepgram_websocket = await create_deepgram_connection(DEEPGRAM_URL, DEEPGRAM_API_KEY)
                             # Start listening task for Deepgram responses
                             deepgram_task = asyncio.create_task(
-                                handle_deepgram_messages(deepgram_websocket, client_websocket,
-                                                        lambda transcript, ws: handle_ai_response(transcript, ws, cleanup_deepgram))
+                                handle_deepgram_messages(deepgram_websocket, client_websocket)
                             )
                             print("✅ Deepgram WebSocket connection established")
                         except Exception as e:
@@ -379,12 +361,24 @@ async def websocket_endpoint(client_websocket: WebSocket):
                     data = json.loads(message["text"])
 
                     if data["type"] == "user_audio_end":
-                        print(f"🛑 Audio stream ended, sending CloseStream to Deepgram... (Total audio sent: {total_audio_bytes_sent} bytes)")
+                        print(f"🛑 Audio stream ended, sending CloseStream to Deepgram...")
 
                         # Send close stream signal to Deepgram
                         if deepgram_websocket:
                             await send_close_stream(deepgram_websocket)
-                            # Don't close Deepgram yet - let AI processing complete first
+
+                            # Wait for Deepgram to finish processing and return the full transcript
+                            if deepgram_task:
+                                final_transcript = await deepgram_task
+                                print(f"✅ Final transcript received: '{final_transcript}'")
+
+                                # Now, handle the AI response with the complete transcript
+                                await handle_ai_response(final_transcript, client_websocket)
+
+                                # Reset for the next turn
+                                deepgram_websocket = None
+                                deepgram_task = None
+                                final_transcript = ""
                         else:
                             print("⚠️ user_audio_end received but no deepgram_websocket exists!")
 
