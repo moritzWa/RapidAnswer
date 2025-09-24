@@ -32,6 +32,7 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [chats, setChats] = useState<Chat[]>([]);
   const [recordingChat, setRecordingChat] = useState<Chat | null>(null);
+  const [isConversationActive, setIsConversationActive] = useState(false);
 
   // Refs to hold the latest chat states to avoid useEffect dependency cycles
   const activeChatRef = useRef(activeChat);
@@ -117,8 +118,11 @@ function App() {
       reconnectInterval: 2000,
     });
 
-  const { playPCMChunkScheduled, cleanup: cleanupPlayback } =
-    useAudioPlayback();
+  const {
+    playPCMChunkScheduled,
+    cleanup: cleanupPlayback,
+    stopPlayback,
+  } = useAudioPlayback();
 
   const {
     startRecording,
@@ -156,6 +160,11 @@ function App() {
               type: "interim",
               content: data.text,
             });
+            break;
+
+          case "stop_audio_playback":
+            console.log(" Muting audio playback due to interruption");
+            stopPlayback();
             break;
 
           case "ai_response_stream":
@@ -218,7 +227,7 @@ function App() {
 
       handleMessage();
     }
-  }, [lastMessage, database, forceCleanupAudio]);
+  }, [lastMessage, database, forceCleanupAudio, stopPlayback]);
 
   const testWithHardcodedAudio = useCallback(async () => {
     if (recordingState !== "idle") return;
@@ -239,6 +248,15 @@ function App() {
   const handleStopRecording = useCallback(() => {
     stopRecording();
   }, [stopRecording]);
+
+  // Handle conversation toggle
+  useEffect(() => {
+    if (isConversationActive) {
+      handleStartRecording();
+    } else {
+      handleStopRecording();
+    }
+  }, [isConversationActive, handleStartRecording, handleStopRecording]);
 
   React.useEffect(() => {
     return () => {
@@ -306,23 +324,14 @@ function App() {
         <button
           type="button"
           className={`px-6 py-3 rounded font-medium ${
-            recordingState === "recording"
+            isConversationActive
               ? "bg-red-500 text-white"
-              : "bg-blue-500 text-white hover:bg-blue-600"
+              : "bg-green-500 text-white hover:bg-green-600"
           } disabled:bg-gray-300 disabled:cursor-not-allowed`}
-          onMouseDown={handleStartRecording}
-          onMouseUp={handleStopRecording}
-          disabled={
-            recordingState === "processing" || readyState !== ReadyState.OPEN
-          }
+          onClick={() => setIsConversationActive((prev) => !prev)}
+          disabled={readyState !== ReadyState.OPEN}
         >
-          {recordingState === "recording"
-            ? "Recording..."
-            : recordingState === "processing"
-            ? "Processing..."
-            : readyState !== ReadyState.OPEN
-            ? "Connecting..."
-            : "Hold to Speak"}
+          {isConversationActive ? "Stop Conversation" : "Start Conversation"}
         </button>
 
         <button
