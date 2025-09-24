@@ -209,8 +209,9 @@ function App() {
               });
             }
             setRecordingChat(null);
-            console.log("✅ Setting state to idle");
-            setRecordingState("idle");
+            // No longer set recording state to idle here; it's controlled by the toggle button
+            // console.log("✅ Setting state to idle");
+            // setRecordingState("idle");
             break;
 
           case "error":
@@ -256,7 +257,7 @@ function App() {
     } else {
       handleStopRecording();
     }
-  }, [isConversationActive, handleStartRecording, handleStopRecording]);
+  }, [isConversationActive]);
 
   React.useEffect(() => {
     return () => {

@@ -76,15 +76,39 @@ async def websocket_endpoint(client_websocket: WebSocket):
         async def handle_transcripts():
             nonlocal ai_task
             full_transcript = ""
+            turn_timer = None
+
+            async def reset_turn_timer():
+                nonlocal turn_timer
+                if turn_timer:
+                    turn_timer.cancel()
+                turn_timer = asyncio.create_task(asyncio.sleep(0.5)) # 500ms timer
+                return turn_timer
+
             async for transcript_part in transcript_generator:
                 full_transcript += transcript_part + " "
                 
+                timer_task = await reset_turn_timer()
+
                 if ai_task and not ai_task.done():
                     print("Barge-in detected. Cancelling previous AI response.")
                     ai_task.cancel()
                     await client_websocket.send_text(json.dumps({"type": "stop_audio_playback"}))
-                
-                ai_task = asyncio.create_task(handle_ai_response(full_transcript, client_websocket))
+
+                try:
+                    await timer_task # Wait for the timer to complete
+                    # If the timer completes without being cancelled, the user has paused.
+                    print(f"User paused. Full transcript: '{full_transcript.strip()}'")
+                    ai_task = asyncio.create_task(handle_ai_response(full_transcript.strip(), client_websocket))
+                    
+                    # Wait for AI task to complete and check if it was successful
+                    if await ai_task:
+                         full_transcript = "" # Reset for the next turn only on success
+
+                except asyncio.CancelledError:
+                    # Timer was reset, continue accumulating transcript
+                    print("Timer reset. Continuing to accumulate transcript.")
+                    continue
 
         await asyncio.gather(forward_audio(), handle_transcripts())
 
@@ -93,8 +117,11 @@ async def websocket_endpoint(client_websocket: WebSocket):
     finally:
         if ai_task and not ai_task.done():
             ai_task.cancel()
-        await client_websocket.close()
-        print("🔌 WebSocket connection closed")
+        try:
+            await client_websocket.close()
+            print("🔌 WebSocket connection closed")
+        except Exception:
+            print("🔌 WebSocket connection already closed.")
 
 
 if __name__ == "__main__":
