@@ -1,29 +1,22 @@
-import { ReadyState } from 'react-use-websocket';
+import { ReadyState } from "react-use-websocket";
+
+type SendMessage = (message: ArrayBuffer) => void;
+type SendJsonMessage = (message: any) => void;
 
 export interface TestAudioParams {
-  recordingState: string;
   readyState: ReadyState;
-  sendMessage: (message: ArrayBuffer) => void;
-  sendJsonMessage: (message: any) => void;
-  setRecordingState: (state: "idle" | "recording" | "processing") => void;
+  sendMessage: SendMessage;
+  sendJsonMessage: SendJsonMessage;
   setError: (error: string | null) => void;
 }
 
 export const sendTestAudio = async (params: TestAudioParams): Promise<void> => {
-  const {
-    recordingState,
-    readyState,
-    sendMessage,
-    sendJsonMessage,
-    setRecordingState,
-    setError
-  } = params;
+  const { readyState, sendMessage, sendJsonMessage, setError } = params;
 
-  if (recordingState !== "idle") return;
+  if (readyState !== ReadyState.OPEN) return;
 
   try {
     setError(null);
-    setRecordingState("recording");
 
     // Wait for WebSocket connection if needed
     if (readyState !== ReadyState.OPEN) {
@@ -33,7 +26,7 @@ export const sendTestAudio = async (params: TestAudioParams): Promise<void> => {
     }
 
     // Load test PCM audio data
-    const response = await fetch("/eval_data/test.pcm");
+    const response = await fetch("/eval_data/new_test.pcm");
     const testPCMBuffer = await response.arrayBuffer();
     const pcmArray = new Int16Array(testPCMBuffer);
 
@@ -52,12 +45,9 @@ export const sendTestAudio = async (params: TestAudioParams): Promise<void> => {
     if (readyState === ReadyState.OPEN) {
       sendJsonMessage({ type: "user_audio_end" });
     }
-
-    setRecordingState("processing");
   } catch (err) {
     setError(
       `Test failed: ${err instanceof Error ? err.message : "Unknown error"}`
     );
-    setRecordingState("idle");
   }
 };
