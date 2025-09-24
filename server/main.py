@@ -11,7 +11,9 @@ from deepgram_handler import (
     create_deepgram_connection,
     handle_deepgram_messages,
     send_close_stream,
-    forward_audio_chunk
+    forward_audio_chunk,
+    reset_audio_counter,
+    total_audio_bytes_sent
 )
 
 load_dotenv()
@@ -107,11 +109,19 @@ async def stream_openai_response(text: str, websocket: WebSocket, sentence_handl
     full_response = ""
     sentence_buffer = ""
 
+    # Handle empty/unclear audio gracefully
+    if text == "[AUDIO_UNCLEAR]":
+        user_message = "I didn't hear you clearly. Could you repeat that?"
+        system_message = "You are a helpful assistant. The user's audio was unclear, so respond as if you didn't hear them properly. Keep responses conversational and concise."
+    else:
+        user_message = text
+        system_message = "You are a helpful assistant. Keep responses conversational and concise."
+
     stream = openai.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": "You are a helpful assistant. Keep responses conversational and concise."},
-            {"role": "user", "content": text}
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": user_message}
         ],
         stream=True
     )
@@ -340,6 +350,7 @@ async def websocket_endpoint(client_websocket: WebSocket):
                     if deepgram_websocket is None:
                         try:
                             print("🎙️ Creating new Deepgram connection for recording session")
+                            reset_audio_counter()  # Reset byte counter for new session
                             deepgram_websocket = await create_deepgram_connection(DEEPGRAM_URL, DEEPGRAM_API_KEY)
                             # Start listening task for Deepgram responses
                             deepgram_task = asyncio.create_task(
@@ -368,12 +379,14 @@ async def websocket_endpoint(client_websocket: WebSocket):
                     data = json.loads(message["text"])
 
                     if data["type"] == "user_audio_end":
-                        print("🛑 Audio stream ended, sending CloseStream to Deepgram...")
+                        print(f"🛑 Audio stream ended, sending CloseStream to Deepgram... (Total audio sent: {total_audio_bytes_sent} bytes)")
 
                         # Send close stream signal to Deepgram
                         if deepgram_websocket:
                             await send_close_stream(deepgram_websocket)
                             # Don't close Deepgram yet - let AI processing complete first
+                        else:
+                            print("⚠️ user_audio_end received but no deepgram_websocket exists!")
 
     except Exception as e:
         print(f"❌ WebSocket handler error: {str(e)}")
