@@ -60,15 +60,16 @@ async def handle_deepgram_messages(deepgram_websocket, client_websocket, ai_resp
 
     except Exception as e:
         print(f"Deepgram message handling error: {e}")
-        # Send error to client
-        error_response = {
-            "type": "error",
-            "message": f"Transcription error: {e}"
-        }
-        try:
-            await client_websocket.send_text(json.dumps(error_response))
-        except:
-            pass
+        # Don't send error to client for normal connection closures
+        if "1000" not in str(e):
+            error_response = {
+                "type": "error",
+                "message": f"Transcription error: {e}"
+            }
+            try:
+                await client_websocket.send_text(json.dumps(error_response))
+            except:
+                pass
 
 
 async def send_close_stream(deepgram_websocket):
@@ -90,5 +91,11 @@ async def forward_audio_chunk(deepgram_websocket, audio_chunk):
         await deepgram_websocket.send(audio_chunk)
         print(f"Forwarded audio chunk: {len(audio_chunk)} bytes")
     except Exception as e:
-        print(f"Error forwarding audio to Deepgram: {e}")
-        raise
+        error_msg = str(e)
+        print(f"Error forwarding audio to Deepgram: {error_msg}")
+        # Don't raise on normal connection closures (code 1000/1001)
+        if "1000" not in error_msg and "1001" not in error_msg and "received 1000" not in error_msg:
+            print(f"⚠️  Re-raising non-normal Deepgram error: {error_msg}")
+            raise
+        else:
+            print(f"🔇 Ignoring normal Deepgram closure: {error_msg}")

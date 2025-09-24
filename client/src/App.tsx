@@ -1,4 +1,5 @@
 import React, { useCallback, useRef, useState } from "react";
+import useWebSocket, { ReadyState } from 'react-use-websocket';
 import "./App.css";
 
 interface ChatMessage {
@@ -21,32 +22,45 @@ function App() {
     null
   );
   const [streamingResponse, setStreamingResponse] = useState<string>("");
-  const [streamingAudio, setStreamingAudio] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
 
-  const wsRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
   const playbackContextRef = useRef<AudioContext | null>(null);
   const nextPlayTimeRef = useRef<number>(0);
 
-  // Helper function to play audio from base64 (fallback)
-  const playAudioFromBase64 = (audioBase64: string) => {
-    try {
-      const audioData = atob(audioBase64);
-      const audioArray = new Uint8Array(audioData.length);
-      for (let i = 0; i < audioData.length; i++) {
-        audioArray[i] = audioData.charCodeAt(i);
-      }
-      const audioBlob = new Blob([audioArray], { type: "audio/mpeg" });
-      const audioUrl = URL.createObjectURL(audioBlob);
-      const audio = new Audio(audioUrl);
-      audio.play();
-    } catch (error) {
-      console.error("Error playing audio:", error);
+  // WebSocket connection using react-use-websocket
+  const { sendMessage, sendJsonMessage, lastMessage, readyState } = useWebSocket(
+    "ws://localhost:8000/ws",
+    {
+      onOpen: () => {
+        console.log("🔌 WebSocket connection established");
+        setError(null);
+      },
+      onClose: (event) => {
+        console.log("❌ WebSocket connection closed:", {
+          code: event.code,
+          reason: event.reason,
+          wasClean: event.wasClean
+        });
+        setRecordingState("idle");
+      },
+      onError: (event) => {
+        console.error("❌ WebSocket error:", event);
+        setError("Connection error");
+        setRecordingState("idle");
+      },
+      shouldReconnect: (closeEvent) => {
+        // Reconnect unless it was a normal closure
+        return closeEvent.code !== 1000;
+      },
+      reconnectAttempts: 10,
+      reconnectInterval: 2000,
     }
-  };
+  );
+
 
   // Schedule PCM chunk for precise 2x speed playback using Web Audio API timing
   const playPCMChunkScheduled = async (
@@ -114,128 +128,124 @@ function App() {
 
   // Send raw PCM data directly
   const sendPCMData = (pcmData: Int16Array) => {
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-      console.warn("WebSocket not connected, reconnecting...");
-      initWebSocket();
+    if (readyState !== ReadyState.OPEN) {
+      console.warn("WebSocket not connected, ready state:", readyState);
+      // Stop recording if connection is lost
+      if (recordingState === "recording") {
+        setError("Connection lost during recording");
+        setRecordingState("idle");
+      }
+      return;
+    }
+    sendMessage(pcmData.buffer);
+  };
+
+  // Handle incoming WebSocket messages
+  React.useEffect(() => {
+    if (lastMessage !== null) {
+      const handleMessage = async () => {
+        const data = JSON.parse(lastMessage.data);
+
+        if (data.type === "interim_transcription") {
+          // Show interim transcription in real-time
+          setInterimMessage({
+            type: "interim",
+            content: data.text,
+          });
+        } else if (data.type === "ai_response_stream") {
+          if (data.is_complete) {
+            // Streaming response complete
+            setStreamingResponse("");
+          } else {
+            // Append streaming content
+            setStreamingResponse((prev) => prev + data.content);
+          }
+        } else if (data.type === "audio_stream_pcm") {
+          // Schedule PCM chunk for precise 2x speed playback
+          if (data.pcm_chunk) {
+            await playPCMChunkScheduled(
+              data.pcm_chunk,
+              data.sample_rate,
+              data.channels
+            );
+          }
+        } else if (data.type === "voice_response") {
+          console.log("📄 Received voice_response, ensuring audio cleanup");
+
+          // CRITICAL: Ensure all audio processing is stopped
+          if (processorRef.current) {
+            console.log("🚨 Force disconnecting lingering processor");
+            processorRef.current.disconnect();
+            processorRef.current = null;
+          }
+
+          if (sourceRef.current) {
+            console.log("🚨 Force disconnecting lingering source");
+            sourceRef.current.disconnect();
+            sourceRef.current = null;
+          }
+
+          if (streamRef.current) {
+            console.log("🚨 Force stopping lingering stream");
+            streamRef.current.getTracks().forEach(track => track.stop());
+            streamRef.current = null;
+          }
+
+          // Clear interim message and streaming response
+          setInterimMessage(null);
+          setStreamingResponse("");
+
+          // Add user message (transcription)
+          setMessages((prev) => [
+            ...prev,
+            {
+              type: "user",
+              content: data.transcription,
+              timestamp: new Date(),
+            },
+          ]);
+
+          // Add assistant response
+          setMessages((prev) => [
+            ...prev,
+            {
+              type: "assistant",
+              content: data.ai_response,
+              timestamp: new Date(),
+            },
+          ]);
+
+          console.log("✅ Setting state to idle");
+          setRecordingState("idle");
+        } else if (data.type === "error") {
+          // Handle server errors
+          setError(data.message);
+          setRecordingState("idle");
+          setInterimMessage(null);
+          setStreamingResponse("");
+        }
+      };
+
+      handleMessage();
+    }
+  }, [lastMessage]);
+
+  const startRecording = useCallback(async () => {
+    console.log("🎤 startRecording called, current state:", recordingState);
+    if (recordingState !== "idle") {
+      console.log("⚠️  startRecording blocked, not idle:", recordingState);
       return;
     }
 
-    wsRef.current.send(pcmData.buffer);
-  };
-
-  // Initialize WebSocket connection
-  const initWebSocket = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return;
-
-    const ws = new WebSocket("ws://localhost:8000/ws");
-
-    ws.onopen = () => {
-      setError(null);
-    };
-
-    ws.onmessage = async (event) => {
-      const data = JSON.parse(event.data);
-
-      if (data.type === "interim_transcription") {
-        // Show interim transcription in real-time
-        setInterimMessage({
-          type: "interim",
-          content: data.text,
-        });
-      } else if (data.type === "ai_response_stream") {
-        if (data.is_complete) {
-          // Streaming response complete
-          setStreamingResponse("");
-        } else {
-          // Append streaming content
-          setStreamingResponse((prev) => prev + data.content);
-        }
-      } else if (data.type === "audio_stream_pcm") {
-        // Schedule PCM chunk for precise 2x speed playback
-        if (data.pcm_chunk) {
-          await playPCMChunkScheduled(
-            data.pcm_chunk,
-            data.sample_rate,
-            data.channels
-          );
-        }
-      } else if (data.type === "audio_stream") {
-        if (data.is_final) {
-          // Audio streaming complete, play the accumulated audio (fallback)
-          const completeAudio = streamingAudio + data.audio_chunk;
-          playAudioFromBase64(completeAudio);
-          setStreamingAudio("");
-        } else {
-          // Accumulate audio chunks (fallback)
-          setStreamingAudio((prev) => prev + data.audio_chunk);
-        }
-      } else if (data.type === "voice_response") {
-        // Clear interim message and streaming response
-        setInterimMessage(null);
-        setStreamingResponse("");
-
-        // Add user message (transcription)
-        setMessages((prev) => [
-          ...prev,
-          {
-            type: "user",
-            content: data.transcription,
-            timestamp: new Date(),
-          },
-        ]);
-
-        // Add assistant response
-        setMessages((prev) => [
-          ...prev,
-          {
-            type: "assistant",
-            content: data.ai_response,
-            timestamp: new Date(),
-          },
-        ]);
-
-        // Play audio response (fallback for non-streaming)
-        if (data.audio) {
-          playAudioFromBase64(data.audio);
-        }
-
-        setRecordingState("idle");
-      } else if (data.type === "error") {
-        // Handle server errors
-        setError(data.message);
-        setRecordingState("idle");
-        setInterimMessage(null);
-        setStreamingResponse("");
-        setStreamingAudio("");
-      }
-    };
-
-    ws.onerror = (error) => {
-      console.error("WebSocket error:", error);
-      setError("Connection error");
-      setRecordingState("idle");
-    };
-
-    ws.onclose = (event) => {
-      setRecordingState("idle");
-
-      // Reconnect after 2 seconds if not a normal closure
-      if (event.code !== 1000) {
-        setTimeout(() => {
-          if (wsRef.current?.readyState !== WebSocket.OPEN) {
-            initWebSocket();
-          }
-        }, 2000);
-      }
-    };
-
-    wsRef.current = ws;
-  }, []);
-
-  const startRecording = useCallback(async () => {
-    if (recordingState !== "idle") return;
+    // Check WebSocket connection before starting
+    if (readyState !== ReadyState.OPEN) {
+      console.log("❌ startRecording blocked, WebSocket not open:", readyState);
+      setError("WebSocket not connected. Please wait and try again.");
+      return;
+    }
 
     try {
+      console.log("🚀 Starting recording session");
       setError(null);
       setRecordingState("recording");
 
@@ -247,6 +257,7 @@ function App() {
           noiseSuppression: true,
         },
       });
+      streamRef.current = stream;
 
       // Initialize AudioContext for direct PCM capture
       if (!audioContextRef.current) {
@@ -300,29 +311,45 @@ function App() {
       );
       setRecordingState("idle");
     }
-  }, [recordingState]);
+  }, [recordingState, readyState]);
 
   const stopRecording = useCallback(() => {
+    console.log("🛑 stopRecording called, current state:", recordingState);
     if (recordingState === "recording") {
+      console.log("🧹 Cleaning up audio processing");
+
       // Clean up audio processing
       if (processorRef.current) {
+        console.log("📢 Disconnecting audio processor");
         processorRef.current.disconnect();
         processorRef.current = null;
       }
 
       if (sourceRef.current) {
+        console.log("🎧 Disconnecting audio source");
         sourceRef.current.disconnect();
         sourceRef.current = null;
       }
 
-      // Send end-of-stream signal
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: "user_audio_end" }));
+      // Stop microphone stream to release red dot
+      if (streamRef.current) {
+        console.log("🔴 Stopping microphone stream");
+        streamRef.current.getTracks().forEach(track => track.stop());
+        streamRef.current = null;
       }
 
+      // Send end-of-stream signal
+      if (readyState === ReadyState.OPEN) {
+        console.log("📤 Sending user_audio_end");
+        sendJsonMessage({ type: "user_audio_end" });
+      }
+
+      console.log("⏳ Setting state to processing");
       setRecordingState("processing");
+    } else {
+      console.log("⚠️  stopRecording called but not in recording state:", recordingState);
     }
-  }, [recordingState]);
+  }, [recordingState, readyState]);
 
   // Test function with hardcoded audio data
   const testWithHardcodedAudio = useCallback(async () => {
@@ -332,9 +359,9 @@ function App() {
       setError(null);
       setRecordingState("recording");
 
-      // Initialize WebSocket if needed
-      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-        initWebSocket();
+      // Wait for WebSocket connection if needed
+      if (readyState !== ReadyState.OPEN) {
+        console.warn("WebSocket not connected, waiting...");
         // Wait a bit for connection
         await new Promise((resolve) => setTimeout(resolve, 500));
       }
@@ -348,16 +375,16 @@ function App() {
       const chunkSize = 1600; // Same as real recording (100ms at 16kHz)
       for (let i = 0; i < pcmArray.length; i += chunkSize) {
         const chunk = pcmArray.slice(i, i + chunkSize);
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          wsRef.current.send(chunk.buffer);
+        if (readyState === ReadyState.OPEN) {
+          sendMessage(chunk.buffer);
           // Small delay to simulate real-time recording
           await new Promise((resolve) => setTimeout(resolve, 100));
         }
       }
 
       // Send end-of-stream signal
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: "user_audio_end" }));
+      if (readyState === ReadyState.OPEN) {
+        sendJsonMessage({ type: "user_audio_end" });
       }
 
       setRecordingState("processing");
@@ -367,18 +394,12 @@ function App() {
       );
       setRecordingState("idle");
     }
-  }, [recordingState, initWebSocket]);
+  }, [recordingState, readyState, sendMessage]);
 
-  // Initialize WebSocket on component mount
+  // Cleanup audio contexts on component unmount
   React.useEffect(() => {
-    initWebSocket();
     return () => {
-      console.log("Cleaning up WebSocket connection");
-      // Cleanup WebSocket
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
-
+      console.log("Cleaning up audio contexts");
       // Cleanup audio processing
       if (processorRef.current) {
         processorRef.current.disconnect();
@@ -438,6 +459,14 @@ function App() {
       </div>
 
       <div className="controls">
+        <div className="connection-status">
+          Status: {readyState === ReadyState.CONNECTING && "Connecting..."}
+          {readyState === ReadyState.OPEN && "Connected"}
+          {readyState === ReadyState.CLOSING && "Disconnecting..."}
+          {readyState === ReadyState.CLOSED && "Disconnected"}
+          {readyState === ReadyState.UNINSTANTIATED && "Not started"}
+        </div>
+
         <button
           type="button"
           className={`record-button ${
@@ -445,14 +474,14 @@ function App() {
           }`}
           onMouseDown={startRecording}
           onMouseUp={stopRecording}
-          onTouchStart={startRecording}
-          onTouchEnd={stopRecording}
-          disabled={recordingState === "processing"}
+          disabled={recordingState === "processing" || readyState !== ReadyState.OPEN}
         >
           {recordingState === "recording"
             ? "Recording..."
             : recordingState === "processing"
             ? "Processing..."
+            : readyState !== ReadyState.OPEN
+            ? "Connecting..."
             : "Hold to Speak"}
         </button>
 

@@ -36,15 +36,17 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 DEEPGRAM_URL = "wss://api.deepgram.com/v1/listen"
 
 
-async def handle_ai_response(transcription: str, client_websocket: WebSocket):
+async def handle_ai_response(transcription: str, client_websocket: WebSocket, cleanup_callback=None):
     """
     Process final transcription and generate AI response with TTS streaming
     """
+    print(f"📝 Starting AI response for: '{transcription}'")
     try:
         ai_response = await get_ai_response_with_sentence_streaming(
             transcription,
             client_websocket
         )
+        print(f"✅ AI response completed: '{ai_response[:50]}...'")
 
         # Send final response back to client
         response = {
@@ -54,26 +56,50 @@ async def handle_ai_response(transcription: str, client_websocket: WebSocket):
             "audio": ""  # Audio was already streamed
         }
         await client_websocket.send_text(json.dumps(response))
+        print(f"📤 Sent final voice_response to client")
 
     except Exception as e:
-        print(f"AI response error: {e}")
+        print(f"❌ AI response error: {e}")
+        import traceback
+        print(f"🔍 Full traceback: {traceback.format_exc()}")
         error_response = {
             "type": "error",
             "message": f"AI response failed: {e}"
         }
-        await client_websocket.send_text(json.dumps(error_response))
+        try:
+            await client_websocket.send_text(json.dumps(error_response))
+        except Exception as send_error:
+            print(f"❌ Failed to send error response: {send_error}")
+    finally:
+        # Clean up Deepgram connection after AI processing is complete
+        if cleanup_callback:
+            await cleanup_callback()
 
 
 async def manage_audio_queue(audio_queue: asyncio.Queue, websocket: WebSocket):
     """Send audio chunks from queue to client"""
-    while True:
-        chunk = await audio_queue.get()
-        if chunk is None:
-            # Sentinel value received, stop sending
+    print("🎵 Audio queue manager started")
+    try:
+        while True:
+            chunk = await audio_queue.get()
+            if chunk is None:
+                # Sentinel value received, stop sending
+                print("🛑 Audio queue received stop signal")
+                audio_queue.task_done()
+                break
+
+            # Log final audio chunks
+            if chunk.get("is_final"):
+                print(f"🎯 Sending final audio chunk: {chunk.get('type')}")
+
+            await websocket.send_text(json.dumps(chunk))
             audio_queue.task_done()
-            break
-        await websocket.send_text(json.dumps(chunk))
-        audio_queue.task_done()
+    except Exception as e:
+        print(f"❌ Audio queue error: {e}")
+        import traceback
+        print(f"🔍 Audio queue traceback: {traceback.format_exc()}")
+    finally:
+        print("🏁 Audio queue manager stopped")
 
 
 async def stream_openai_response(text: str, websocket: WebSocket, sentence_handler):
@@ -191,6 +217,7 @@ async def synthesize_speech_streaming(
     Convert text to speech using OpenAI's streaming TTS API and put chunks in a queue,
     respecting an event chain for ordering.
     """
+    print(f"🎤 Starting TTS for: '{text[:30]}...'")
     try:
         # Use AsyncOpenAI client for streaming response
         async with async_openai_client.audio.speech.with_streaming_response.create(
@@ -242,13 +269,17 @@ async def synthesize_speech_streaming(
                 "is_final": True
             }
             await audio_queue.put(final_response)
+            print(f"✅ TTS completed for: '{text[:30]}...'")
 
     except Exception as e:
-        print(f"TTS streaming error: {e}")
+        print(f"❌ TTS streaming error for '{text[:30]}...': {e}")
+        import traceback
+        print(f"🔍 TTS traceback: {traceback.format_exc()}")
         # We don't re-raise here to avoid crashing the entire process
         # The client will simply not receive audio for this sentence.
     finally:
         # Signal that this sentence is done, allowing the next one to proceed.
+        print(f"🔄 TTS event set for: '{text[:30]}...'")
         set_event_when_done.set()
 
 
@@ -264,6 +295,27 @@ async def websocket_endpoint(client_websocket: WebSocket):
 
     deepgram_websocket = None
     deepgram_task = None
+
+    async def cleanup_deepgram():
+        """Clean up Deepgram connection after AI processing completes"""
+        nonlocal deepgram_websocket, deepgram_task
+        if deepgram_websocket:
+            try:
+                await deepgram_websocket.close()
+                print("🔄 Deepgram connection closed, ready for next turn")
+            except Exception as close_error:
+                print(f"⚠️  Error closing Deepgram: {close_error}")
+            finally:
+                deepgram_websocket = None
+
+        if deepgram_task:
+            deepgram_task.cancel()
+            try:
+                await deepgram_task
+            except asyncio.CancelledError:
+                print("🛑 Deepgram task cancelled for next turn")
+            finally:
+                deepgram_task = None
 
     try:
         while True:
@@ -284,17 +336,19 @@ async def websocket_endpoint(client_websocket: WebSocket):
                     # Binary audio chunk
                     audio_chunk = message["bytes"]
 
-                    # Create Deepgram connection on first audio chunk
+                    # Create fresh Deepgram connection for new recording session
                     if deepgram_websocket is None:
                         try:
+                            print("🎙️ Creating new Deepgram connection for recording session")
                             deepgram_websocket = await create_deepgram_connection(DEEPGRAM_URL, DEEPGRAM_API_KEY)
                             # Start listening task for Deepgram responses
                             deepgram_task = asyncio.create_task(
-                                handle_deepgram_messages(deepgram_websocket, client_websocket, handle_ai_response)
+                                handle_deepgram_messages(deepgram_websocket, client_websocket,
+                                                        lambda transcript, ws: handle_ai_response(transcript, ws, cleanup_deepgram))
                             )
-                            print("Deepgram WebSocket connection established")
+                            print("✅ Deepgram WebSocket connection established")
                         except Exception as e:
-                            print(f"Failed to create Deepgram connection: {e}")
+                            print(f"❌ Failed to create Deepgram connection: {e}")
                             error_response = {
                                 "type": "error",
                                 "message": f"Failed to connect to transcription service: {e}"
@@ -302,35 +356,43 @@ async def websocket_endpoint(client_websocket: WebSocket):
                             await client_websocket.send_text(json.dumps(error_response))
                             continue
 
-                    # Forward audio chunk directly to Deepgram
-                    await forward_audio_chunk(deepgram_websocket, audio_chunk)
+                    # Forward audio chunk directly to Deepgram (if still connected)
+                    try:
+                        await forward_audio_chunk(deepgram_websocket, audio_chunk)
+                    except Exception as forward_error:
+                        print(f"⚠️  Could not forward audio to Deepgram: {forward_error}")
+                        # Don't crash the WebSocket handler for Deepgram issues
 
                 elif "text" in message:
                     # JSON control message
                     data = json.loads(message["text"])
 
                     if data["type"] == "user_audio_end":
-                        print("Audio stream ended, sending CloseStream to Deepgram...")
+                        print("🛑 Audio stream ended, sending CloseStream to Deepgram...")
 
                         # Send close stream signal to Deepgram
                         if deepgram_websocket:
                             await send_close_stream(deepgram_websocket)
+                            # Don't close Deepgram yet - let AI processing complete first
 
     except Exception as e:
-        print(f"WebSocket error: {str(e)}")
+        print(f"❌ WebSocket handler error: {str(e)}")
+        import traceback
+        print(f"🔍 WebSocket handler traceback: {traceback.format_exc()}")
         try:
             if client_websocket.client_state.value == 1:  # OPEN state
+                print("🔌 Closing client WebSocket due to error")
                 await client_websocket.close()
-        except:
-            pass
+        except Exception as close_error:
+            print(f"❌ Error closing WebSocket: {close_error}")
     finally:
         # Cleanup Deepgram connection
         if deepgram_websocket:
             try:
                 await deepgram_websocket.close()
-                print("Deepgram WebSocket connection closed")
-            except:
-                pass
+                print("🔌 Deepgram WebSocket connection closed")
+            except Exception as cleanup_error:
+                print(f"⚠️  Error closing Deepgram connection: {cleanup_error}")
 
         # Cancel Deepgram listening task
         if deepgram_task:
@@ -338,7 +400,10 @@ async def websocket_endpoint(client_websocket: WebSocket):
             try:
                 await deepgram_task
             except asyncio.CancelledError:
+                print("🛑 Deepgram task cancelled")
                 pass
+            except Exception as task_error:
+                print(f"⚠️  Error cancelling Deepgram task: {task_error}")
 
 
 if __name__ == "__main__":
