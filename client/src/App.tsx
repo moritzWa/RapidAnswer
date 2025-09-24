@@ -1,6 +1,8 @@
-import React, { useCallback, useRef, useState } from "react";
-import useWebSocket, { ReadyState } from 'react-use-websocket';
-import "./App.css";
+import React, { useCallback, useState } from "react";
+import useWebSocket, { ReadyState } from "react-use-websocket";
+import { useAudioRecording } from './hooks/useAudioRecording';
+import { useAudioPlayback } from './hooks/useAudioPlayback';
+import { sendTestAudio } from './utils/testUtils';
 
 interface ChatMessage {
   type: "user" | "assistant";
@@ -24,17 +26,9 @@ function App() {
   const [streamingResponse, setStreamingResponse] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
 
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
-  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const playbackContextRef = useRef<AudioContext | null>(null);
-  const nextPlayTimeRef = useRef<number>(0);
-
   // WebSocket connection using react-use-websocket
-  const { sendMessage, sendJsonMessage, lastMessage, readyState } = useWebSocket(
-    "ws://localhost:8000/ws",
-    {
+  const { sendMessage, sendJsonMessage, lastMessage, readyState } =
+    useWebSocket("ws://localhost:8000/ws", {
       onOpen: () => {
         console.log("🔌 WebSocket connection established");
         setError(null);
@@ -43,7 +37,7 @@ function App() {
         console.log("❌ WebSocket connection closed:", {
           code: event.code,
           reason: event.reason,
-          wasClean: event.wasClean
+          wasClean: event.wasClean,
         });
         setRecordingState("idle");
       },
@@ -58,87 +52,25 @@ function App() {
       },
       reconnectAttempts: 10,
       reconnectInterval: 2000,
-    }
-  );
+    });
 
+  // Audio playback hook
+  const { playPCMChunkScheduled, cleanup: cleanupPlayback } = useAudioPlayback();
 
-  // Schedule PCM chunk for precise 2x speed playback using Web Audio API timing
-  const playPCMChunkScheduled = async (
-    pcmBase64: string,
-    sampleRate: number,
-    channels: number
-  ) => {
-    try {
-      // Initialize playback AudioContext if needed
-      if (!playbackContextRef.current) {
-        playbackContextRef.current = new AudioContext({ sampleRate });
-        nextPlayTimeRef.current = playbackContextRef.current.currentTime;
-      }
-
-      const context = playbackContextRef.current;
-
-      // Resume AudioContext if suspended (required in modern browsers)
-      if (context.state === "suspended") {
-        await context.resume();
-      }
-
-      // Decode base64 PCM data
-      const pcmData = atob(pcmBase64);
-      const pcmArray = new Uint8Array(pcmData.length);
-      for (let i = 0; i < pcmData.length; i++) {
-        pcmArray[i] = pcmData.charCodeAt(i);
-      }
-
-      // Convert bytes to 16-bit integers
-      const samples = new Int16Array(pcmArray.buffer);
-
-      // Create AudioBuffer
-      const audioBuffer = context.createBuffer(
-        channels,
-        samples.length,
-        sampleRate
-      );
-      const channelData = audioBuffer.getChannelData(0);
-
-      // Convert int16 to float32 and copy to AudioBuffer
-      for (let i = 0; i < samples.length; i++) {
-        channelData[i] = samples[i] / 32768.0;
-      }
-
-      // Calculate chunk duration at normal speed
-      const chunkDurationSeconds = samples.length / sampleRate;
-
-      // Create buffer source (OpenAI already generated at 2x speed)
-      const source = context.createBufferSource();
-      source.buffer = audioBuffer;
-      source.playbackRate.value = 1.0; // Normal playback - OpenAI already did 2x speed
-      source.connect(context.destination);
-
-      // Schedule playback at the precise next time
-      const startTime = Math.max(context.currentTime, nextPlayTimeRef.current);
-
-      source.start(startTime);
-
-      // Update next play time (normal duration since OpenAI already compressed to 2x)
-      nextPlayTimeRef.current = startTime + chunkDurationSeconds;
-    } catch (error) {
-      console.error("Error playing PCM chunk:", error);
-    }
-  };
-
-  // Send raw PCM data directly
-  const sendPCMData = (pcmData: Int16Array) => {
-    if (readyState !== ReadyState.OPEN) {
-      console.warn("WebSocket not connected, ready state:", readyState);
-      // Stop recording if connection is lost
-      if (recordingState === "recording") {
-        setError("Connection lost during recording");
-        setRecordingState("idle");
-      }
-      return;
-    }
-    sendMessage(pcmData.buffer);
-  };
+  // Audio recording hook
+  const {
+    startRecording,
+    stopRecording,
+    forceCleanupAudio,
+    cleanup: cleanupRecording
+  } = useAudioRecording({
+    recordingState,
+    setRecordingState,
+    readyState,
+    setError,
+    sendMessage,
+    sendJsonMessage,
+  });
 
   // Handle incoming WebSocket messages
   React.useEffect(() => {
@@ -146,83 +78,80 @@ function App() {
       const handleMessage = async () => {
         const data = JSON.parse(lastMessage.data);
 
-        if (data.type === "interim_transcription") {
-          // Show interim transcription in real-time
-          setInterimMessage({
-            type: "interim",
-            content: data.text,
-          });
-        } else if (data.type === "ai_response_stream") {
-          if (data.is_complete) {
-            // Streaming response complete
+        switch (data.type) {
+          case "interim_transcription":
+            // Show interim transcription in real-time
+            setInterimMessage({
+              type: "interim",
+              content: data.text,
+            });
+            break;
+
+          case "ai_response_stream":
+            if (data.is_complete) {
+              // Streaming response complete
+              setStreamingResponse("");
+            } else {
+              // Append streaming content
+              setStreamingResponse((prev) => prev + data.content);
+            }
+            break;
+
+          case "audio_stream_pcm":
+            // Schedule PCM chunk for precise 2x speed playback
+            if (data.pcm_chunk) {
+              await playPCMChunkScheduled(
+                data.pcm_chunk,
+                data.sample_rate,
+                data.channels
+              );
+            }
+            break;
+
+          case "voice_response":
+            console.log("📄 Received voice_response, ensuring audio cleanup");
+
+            // CRITICAL: Ensure all audio processing is stopped
+            forceCleanupAudio();
+
+            // Clear interim message and streaming response
+            setInterimMessage(null);
             setStreamingResponse("");
-          } else {
-            // Append streaming content
-            setStreamingResponse((prev) => prev + data.content);
-          }
-        } else if (data.type === "audio_stream_pcm") {
-          // Schedule PCM chunk for precise 2x speed playback
-          if (data.pcm_chunk) {
-            await playPCMChunkScheduled(
-              data.pcm_chunk,
-              data.sample_rate,
-              data.channels
-            );
-          }
-        } else if (data.type === "voice_response") {
-          console.log("📄 Received voice_response, ensuring audio cleanup");
 
-          // CRITICAL: Ensure all audio processing is stopped
-          if (processorRef.current) {
-            console.log("🚨 Force disconnecting lingering processor");
-            processorRef.current.disconnect();
-            processorRef.current = null;
-          }
+            // Add user message (transcription)
+            setMessages((prev) => [
+              ...prev,
+              {
+                type: "user",
+                content: data.transcription,
+                timestamp: new Date(),
+              },
+            ]);
 
-          if (sourceRef.current) {
-            console.log("🚨 Force disconnecting lingering source");
-            sourceRef.current.disconnect();
-            sourceRef.current = null;
-          }
+            // Add assistant response
+            setMessages((prev) => [
+              ...prev,
+              {
+                type: "assistant",
+                content: data.ai_response,
+                timestamp: new Date(),
+              },
+            ]);
 
-          if (streamRef.current) {
-            console.log("🚨 Force stopping lingering stream");
-            streamRef.current.getTracks().forEach(track => track.stop());
-            streamRef.current = null;
-          }
+            console.log("✅ Setting state to idle");
+            setRecordingState("idle");
+            break;
 
-          // Clear interim message and streaming response
-          setInterimMessage(null);
-          setStreamingResponse("");
+          case "error":
+            // Handle server errors
+            setError(data.message);
+            setRecordingState("idle");
+            setInterimMessage(null);
+            setStreamingResponse("");
+            break;
 
-          // Add user message (transcription)
-          setMessages((prev) => [
-            ...prev,
-            {
-              type: "user",
-              content: data.transcription,
-              timestamp: new Date(),
-            },
-          ]);
-
-          // Add assistant response
-          setMessages((prev) => [
-            ...prev,
-            {
-              type: "assistant",
-              content: data.ai_response,
-              timestamp: new Date(),
-            },
-          ]);
-
-          console.log("✅ Setting state to idle");
-          setRecordingState("idle");
-        } else if (data.type === "error") {
-          // Handle server errors
-          setError(data.message);
-          setRecordingState("idle");
-          setInterimMessage(null);
-          setStreamingResponse("");
+          default:
+            console.warn("Unknown message type:", data.type);
         }
       };
 
@@ -230,248 +159,136 @@ function App() {
     }
   }, [lastMessage]);
 
-  const startRecording = useCallback(async () => {
-    console.log("🎤 startRecording called, current state:", recordingState);
-    if (recordingState !== "idle") {
-      console.log("⚠️  startRecording blocked, not idle:", recordingState);
-      return;
-    }
-
-    // Check WebSocket connection before starting
-    if (readyState !== ReadyState.OPEN) {
-      console.log("❌ startRecording blocked, WebSocket not open:", readyState);
-      setError("WebSocket not connected. Please wait and try again.");
-      return;
-    }
-
-    try {
-      console.log("🚀 Starting recording session");
-      setError(null);
-      setRecordingState("recording");
-
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          sampleRate: 16000,
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-        },
-      });
-      streamRef.current = stream;
-
-      // Initialize AudioContext for direct PCM capture
-      if (!audioContextRef.current) {
-        audioContextRef.current = new AudioContext({ sampleRate: 16000 });
-      }
-
-      // Create audio source from stream
-      const source = audioContextRef.current.createMediaStreamSource(stream);
-      sourceRef.current = source;
-
-      // Create script processor for PCM data
-      const processor = audioContextRef.current.createScriptProcessor(
-        4096,
-        1,
-        1
-      );
-      processorRef.current = processor;
-
-      let pcmBuffer: number[] = [];
-
-      processor.onaudioprocess = (event) => {
-        const inputBuffer = event.inputBuffer;
-        const inputData = inputBuffer.getChannelData(0);
-
-        // Accumulate PCM data
-        for (let i = 0; i < inputData.length; i++) {
-          pcmBuffer.push(inputData[i]);
-        }
-
-        // Send data every ~100ms (1600 samples at 16kHz)
-        if (pcmBuffer.length >= 1600) {
-          // Convert float32 to int16
-          const pcm16 = new Int16Array(pcmBuffer.length);
-          for (let i = 0; i < pcmBuffer.length; i++) {
-            pcm16[i] = Math.max(-32768, Math.min(32767, pcmBuffer[i] * 32767));
-          }
-
-          sendPCMData(pcm16);
-          pcmBuffer = [];
-        }
-      };
-
-      // Connect audio processing pipeline
-      source.connect(processor);
-      processor.connect(audioContextRef.current.destination);
-    } catch (err) {
-      setError(
-        `Failed to start recording: ${
-          err instanceof Error ? err.message : "Unknown error"
-        }`
-      );
-      setRecordingState("idle");
-    }
-  }, [recordingState, readyState]);
-
-  const stopRecording = useCallback(() => {
-    console.log("🛑 stopRecording called, current state:", recordingState);
-    if (recordingState === "recording") {
-      console.log("🧹 Cleaning up audio processing");
-
-      // Clean up audio processing
-      if (processorRef.current) {
-        console.log("📢 Disconnecting audio processor");
-        processorRef.current.disconnect();
-        processorRef.current = null;
-      }
-
-      if (sourceRef.current) {
-        console.log("🎧 Disconnecting audio source");
-        sourceRef.current.disconnect();
-        sourceRef.current = null;
-      }
-
-      // Stop microphone stream to release red dot
-      if (streamRef.current) {
-        console.log("🔴 Stopping microphone stream");
-        streamRef.current.getTracks().forEach(track => track.stop());
-        streamRef.current = null;
-      }
-
-      // Send end-of-stream signal
-      if (readyState === ReadyState.OPEN) {
-        console.log("📤 Sending user_audio_end");
-        sendJsonMessage({ type: "user_audio_end" });
-      }
-
-      console.log("⏳ Setting state to processing");
-      setRecordingState("processing");
-    } else {
-      console.log("⚠️  stopRecording called but not in recording state:", recordingState);
-    }
-  }, [recordingState, readyState]);
-
   // Test function with hardcoded audio data
   const testWithHardcodedAudio = useCallback(async () => {
-    if (recordingState !== "idle") return;
+    await sendTestAudio({
+      recordingState,
+      readyState,
+      sendMessage,
+      sendJsonMessage,
+      setRecordingState,
+      setError,
+    });
+  }, [recordingState, readyState, sendMessage, sendJsonMessage]);
 
-    try {
-      setError(null);
-      setRecordingState("recording");
-
-      // Wait for WebSocket connection if needed
-      if (readyState !== ReadyState.OPEN) {
-        console.warn("WebSocket not connected, waiting...");
-        // Wait a bit for connection
-        await new Promise((resolve) => setTimeout(resolve, 500));
+  // Add demo chat messages
+  const addDemoChats = useCallback(() => {
+    const demoMessages: ChatMessage[] = [
+      {
+        type: "user",
+        content: "Hello, can you help me with JavaScript?",
+        timestamp: new Date(Date.now() - 5 * 60000), // 5 minutes ago
+      },
+      {
+        type: "assistant",
+        content: "Of course! I'd be happy to help you with JavaScript. What specific topic or problem are you working on?",
+        timestamp: new Date(Date.now() - 4 * 60000), // 4 minutes ago
+      },
+      {
+        type: "user",
+        content: "I'm trying to understand async/await and promises.",
+        timestamp: new Date(Date.now() - 3 * 60000), // 3 minutes ago
+      },
+      {
+        type: "assistant",
+        content: "Great question! Async/await is syntactic sugar over promises that makes asynchronous code easier to read and write. Here's how they work together:\n\nPromises represent a value that will be available in the future. Async/await lets you write asynchronous code that looks more like synchronous code.",
+        timestamp: new Date(Date.now() - 2 * 60000), // 2 minutes ago
+      },
+      {
+        type: "user",
+        content: "That makes sense! Can you show me an example?",
+        timestamp: new Date(Date.now() - 1 * 60000), // 1 minute ago
+      },
+      {
+        type: "assistant",
+        content: "Sure! Here's a simple example:\n\n```javascript\n// Using async/await\nasync function fetchUserData(id) {\n  try {\n    const response = await fetch(`/api/users/${id}`);\n    const userData = await response.json();\n    return userData;\n  } catch (error) {\n    console.error('Error:', error);\n  }\n}\n```\n\nThis is much cleaner than chaining .then() calls!",
+        timestamp: new Date(), // Now
       }
+    ];
 
-      // Load test PCM audio data
-      const response = await fetch("/eval_data/test.pcm");
-      const testPCMBuffer = await response.arrayBuffer();
-      const pcmArray = new Int16Array(testPCMBuffer);
-
-      // Send the test audio data in chunks (simulate real recording)
-      const chunkSize = 1600; // Same as real recording (100ms at 16kHz)
-      for (let i = 0; i < pcmArray.length; i += chunkSize) {
-        const chunk = pcmArray.slice(i, i + chunkSize);
-        if (readyState === ReadyState.OPEN) {
-          sendMessage(chunk.buffer);
-          // Small delay to simulate real-time recording
-          await new Promise((resolve) => setTimeout(resolve, 100));
-        }
-      }
-
-      // Send end-of-stream signal
-      if (readyState === ReadyState.OPEN) {
-        sendJsonMessage({ type: "user_audio_end" });
-      }
-
-      setRecordingState("processing");
-    } catch (err) {
-      setError(
-        `Test failed: ${err instanceof Error ? err.message : "Unknown error"}`
-      );
-      setRecordingState("idle");
-    }
-  }, [recordingState, readyState, sendMessage]);
+    setMessages(demoMessages);
+  }, []);
 
   // Cleanup audio contexts on component unmount
   React.useEffect(() => {
     return () => {
-      console.log("Cleaning up audio contexts");
-      // Cleanup audio processing
-      if (processorRef.current) {
-        processorRef.current.disconnect();
-      }
-
-      if (sourceRef.current) {
-        sourceRef.current.disconnect();
-      }
-
-      if (audioContextRef.current) {
-        audioContextRef.current.close();
-      }
-
-      // Cleanup playback context
-      if (playbackContextRef.current) {
-        playbackContextRef.current.close();
-      }
+      console.log("🧹 Cleaning up audio contexts");
+      cleanupRecording();
+      cleanupPlayback();
     };
   }, []);
 
   return (
-    <div className="app">
-      <h1>RapidAnswer</h1>
-      <p>Voice chat with AI - Press and hold to speak</p>
+    <div className="h-screen flex flex-col">
+      {/* Navbar */}
+      <nav className="flex justify-between items-center p-4 border-b">
+        <h1 className="text-xl font-semibold">RapidAnswer</h1>
+        <span className="text-sm text-gray-600">
+          {readyState === ReadyState.CONNECTING && "Connecting..."}
+          {readyState === ReadyState.OPEN && "Connected"}
+          {readyState === ReadyState.CLOSING && "Disconnecting..."}
+          {readyState === ReadyState.CLOSED && "Disconnected"}
+          {readyState === ReadyState.UNINSTANTIATED && "Not started"}
+        </span>
+      </nav>
 
-      <div className="chat-container">
+      {/* Full-page chat area */}
+      <main className="flex-1 p-4 overflow-y-auto">
+        {messages.length === 0 && !interimMessage && !streamingResponse && recordingState === "idle" && (
+          <div className="h-full flex items-center justify-center text-gray-500">
+            <p>Voice chat with AI - Press and hold to speak</p>
+          </div>
+        )}
+
         {messages.map((message, index) => (
-          <div key={index} className={`message ${message.type}`}>
-            <strong>{message.type === "user" ? "You" : "Assistant"}:</strong>
-            <div>{message.content}</div>
-            <small>{message.timestamp.toLocaleTimeString()}</small>
+          <div key={index} className={`mb-4 p-3 rounded ${
+            message.type === "user"
+              ? "bg-blue-50 ml-8"
+              : "bg-gray-50 mr-8"
+          }`}>
+            <div className="font-semibold text-sm mb-1">
+              {message.type === "user" ? "You" : "Assistant"}
+            </div>
+            <div className="whitespace-pre-wrap">{message.content}</div>
+            <div className="text-xs text-gray-500 mt-1">
+              {message.timestamp.toLocaleTimeString()}
+            </div>
           </div>
         ))}
 
         {interimMessage && (
-          <div className="message interim">
-            <strong>You (transcribing...):</strong>
+          <div className="mb-4 p-3 rounded bg-blue-100 ml-8 opacity-70">
+            <div className="font-semibold text-sm mb-1">You (transcribing...)</div>
             <div>{interimMessage.content}</div>
           </div>
         )}
 
         {streamingResponse && (
-          <div className="message assistant streaming">
-            <strong>Assistant:</strong>
-            <div>{streamingResponse}</div>
+          <div className="mb-4 p-3 rounded bg-gray-100 mr-8">
+            <div className="font-semibold text-sm mb-1">Assistant</div>
+            <div className="whitespace-pre-wrap">{streamingResponse}</div>
           </div>
         )}
 
         {recordingState === "processing" &&
           !interimMessage &&
           !streamingResponse && (
-            <div className="message assistant">
-              <strong>Assistant:</strong>
+            <div className="mb-4 p-3 rounded bg-gray-100 mr-8">
+              <div className="font-semibold text-sm mb-1">Assistant</div>
               <div>Processing...</div>
             </div>
           )}
-      </div>
+      </main>
 
-      <div className="controls">
-        <div className="connection-status">
-          Status: {readyState === ReadyState.CONNECTING && "Connecting..."}
-          {readyState === ReadyState.OPEN && "Connected"}
-          {readyState === ReadyState.CLOSING && "Disconnecting..."}
-          {readyState === ReadyState.CLOSED && "Disconnected"}
-          {readyState === ReadyState.UNINSTANTIATED && "Not started"}
-        </div>
-
+      {/* Bottom controls */}
+      <footer className="p-4 border-t flex gap-3 justify-center flex-wrap">
         <button
           type="button"
-          className={`record-button ${
-            recordingState === "recording" ? "recording" : ""
-          }`}
+          className={`px-6 py-3 rounded font-medium ${
+            recordingState === "recording"
+              ? "bg-red-500 text-white"
+              : "bg-blue-500 text-white hover:bg-blue-600"
+          } disabled:bg-gray-300 disabled:cursor-not-allowed`}
           onMouseDown={startRecording}
           onMouseUp={stopRecording}
           disabled={recordingState === "processing" || readyState !== ReadyState.OPEN}
@@ -487,15 +304,27 @@ function App() {
 
         <button
           type="button"
-          className="test-button"
+          className="px-4 py-2 border rounded hover:bg-gray-50 disabled:bg-gray-100 disabled:cursor-not-allowed"
           onClick={testWithHardcodedAudio}
           disabled={recordingState === "processing"}
         >
           Dev: Test Input
         </button>
 
-        {error && <div className="error">{error}</div>}
-      </div>
+        <button
+          type="button"
+          className="px-4 py-2 border rounded hover:bg-gray-50"
+          onClick={addDemoChats}
+        >
+          Add Demo Chat
+        </button>
+
+        {error && (
+          <div className="w-full mt-2 p-3 bg-red-50 text-red-700 rounded text-center">
+            {error}
+          </div>
+        )}
+      </footer>
     </div>
   );
 }
