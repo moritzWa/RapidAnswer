@@ -38,7 +38,7 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 DEEPGRAM_URL = "wss://api.deepgram.com/v1/listen"
 
 
-async def handle_ai_response(transcription: str, client_websocket: WebSocket, cleanup_callback=None):
+async def handle_ai_response(transcription: str, client_websocket: WebSocket):
     """
     Process final transcription and generate AI response with TTS streaming
     """
@@ -72,10 +72,6 @@ async def handle_ai_response(transcription: str, client_websocket: WebSocket, cl
             await client_websocket.send_text(json.dumps(error_response))
         except Exception as send_error:
             print(f"❌ Failed to send error response: {send_error}")
-    finally:
-        # Clean up Deepgram connection after AI processing is complete
-        if cleanup_callback:
-            await cleanup_callback()
 
 
 async def manage_audio_queue(audio_queue: asyncio.Queue, websocket: WebSocket):

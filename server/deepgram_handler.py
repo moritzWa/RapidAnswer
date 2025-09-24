@@ -30,7 +30,6 @@ async def handle_deepgram_messages(deepgram_websocket, client_websocket):
     and return the final transcript.
     """
     full_transcript = ""
-    session_completed = False
 
     try:
         async for message in deepgram_websocket:
