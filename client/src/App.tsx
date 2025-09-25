@@ -165,7 +165,6 @@ function App() {
             break;
 
           case "stop_audio_playback":
-            console.log(" Muting audio playback due to interruption");
             stopPlayback();
             break;
 

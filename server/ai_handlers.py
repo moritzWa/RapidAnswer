@@ -43,8 +43,8 @@ async def analyze_response_modifications(transcript: str) -> ResponseModificatio
 
 Rules:
 - needs_web_search: true for recent research, current events, live data, expert opinions
-- has_speed_request: true if user mentions "slower", "faster", "speed up", "slow down"
-- speed_multiplier: 0.5 for slower, 1.0 for normal, 1.5+ for faster, 2.0 for default
+- has_speed_request: true ONLY if the user is explicitly asking the AI assistant to change its speaking speed (e.g., "speak slower", "can you talk faster?"). If words like "slow" or "fast" are used in another context (e.g., "why is my computer slow?"), this must be false.
+- speed_multiplier: 1.5 for slower, 2.2 for normal/default, 2.6+ for faster, etc.
 - explanation: 1-5 words max"""
                 },
                 {
@@ -75,7 +75,7 @@ Rules:
         return ResponseModificationAnalysis(
             needs_web_search=False,
             has_speed_request=False,
-            speed_multiplier=2.0,
+            speed_multiplier=2.5,
             explanation="Analysis failed, using defaults"
         )
 

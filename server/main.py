@@ -40,13 +40,20 @@ async def websocket_endpoint(client_websocket: WebSocket):
 
     ai_task = None
     chat_history = []  # Store conversation history for this connection
+    is_tts_playing = False  # Track TTS playback state for interruption
     
     try:
         config = DeepgramClientOptions(options={"keepalive": "true"})
         deepgram: DeepgramClient = DeepgramClient(DEEPGRAM_API_KEY, config)
         dg_connection = deepgram.listen.asynclive.v("1")
         
-        transcript_generator = get_transcript_generator(client_websocket, dg_connection)
+        # Pass TTS state and AI task getters to transcript generator for interruption detection
+        transcript_generator = get_transcript_generator(
+            client_websocket, 
+            dg_connection,
+            lambda: is_tts_playing,
+            lambda: ai_task
+        )
 
         options = LiveOptions(
             model="nova-2",
@@ -86,7 +93,7 @@ async def websocket_endpoint(client_websocket: WebSocket):
                     await dg_connection.finish()
 
         async def handle_transcripts():
-            nonlocal ai_task, chat_history
+            nonlocal ai_task, chat_history, is_tts_playing
 
             async for complete_transcript in transcript_generator:
                 # transcript_generator now only yields when speech_final=True
@@ -97,12 +104,26 @@ async def websocket_endpoint(client_websocket: WebSocket):
                     print("Barge-in detected. Cancelling previous AI response.")
                     ai_task.cancel()
                     await client_websocket.send_text(json.dumps({"type": "stop_audio_playback"}))
+                    is_tts_playing = False  # Stop playing on cancellation
+                
+                # Only reset TTS state if it wasn't already interrupted
+                # This keeps the state accurate for interruption detection
+                if is_tts_playing:
+                    is_tts_playing = False
 
                 # Start AI response immediately (no additional timer needed)
+                is_tts_playing = True  # Mark TTS as starting
                 ai_task = asyncio.create_task(handle_ai_response(complete_transcript, client_websocket, chat_history))
 
-                # Wait for AI task to complete and update chat history
-                ai_response = await ai_task
+                try:
+                    # Wait for AI task to complete and update chat history
+                    ai_response = await ai_task
+                    # Don't set is_tts_playing to False here - audio is still playing on client!
+                    # It will be set to False when the next utterance starts
+                except asyncio.CancelledError:
+                    print("AI task was cancelled due to interruption")
+                    ai_response = None
+                    is_tts_playing = False  # Only set to False on cancellation
                 if ai_response:
                     # Update chat history with this successful exchange
                     chat_history.append({"role": "user", "content": complete_transcript})

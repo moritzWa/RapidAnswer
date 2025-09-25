@@ -3,6 +3,7 @@ import { useCallback, useRef } from "react";
 export function useAudioPlayback() {
   const playbackContextRef = useRef<AudioContext | null>(null);
   const nextPlayTimeRef = useRef<number>(0);
+  const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
 
   // Schedule PCM chunk for precise 2x speed playback using Web Audio API timing
   const playPCMChunkScheduled = useCallback(
@@ -61,6 +62,17 @@ export function useAudioPlayback() {
 
         source.start(startTime);
 
+        // Track this source so we can stop it if interrupted
+        activeSourcesRef.current.push(source);
+
+        // Remove from tracking when it finishes naturally
+        source.onended = () => {
+          const index = activeSourcesRef.current.indexOf(source);
+          if (index > -1) {
+            activeSourcesRef.current.splice(index, 1);
+          }
+        };
+
         // Update next play time (normal duration since OpenAI already compressed to 2x)
         nextPlayTimeRef.current = startTime + chunkDurationSeconds;
       } catch (error) {
@@ -74,6 +86,16 @@ export function useAudioPlayback() {
   const cleanup = useCallback(() => {
     console.log("🧹 Audio playback cleanup on unmount");
 
+    // Stop any remaining scheduled audio
+    activeSourcesRef.current.forEach((source) => {
+      try {
+        source.stop();
+      } catch (e) {
+        // Source might have already finished, that's ok
+      }
+    });
+    activeSourcesRef.current = [];
+
     if (playbackContextRef.current) {
       playbackContextRef.current.close();
       playbackContextRef.current = null;
@@ -82,6 +104,21 @@ export function useAudioPlayback() {
 
   const stopPlayback = useCallback(() => {
     console.log("🛑 Stopping audio playback");
+
+    // Stop all scheduled audio chunks immediately
+    activeSourcesRef.current.forEach((source) => {
+      try {
+        source.stop();
+      } catch (e) {
+        // Source might have already finished, that's ok
+      }
+    });
+    activeSourcesRef.current = [];
+
+    // Reset the next play time so new audio starts immediately
+    nextPlayTimeRef.current = 0;
+
+    // Close the audio context
     if (playbackContextRef.current) {
       playbackContextRef.current.close();
       playbackContextRef.current = null;

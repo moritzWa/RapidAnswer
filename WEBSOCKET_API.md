@@ -10,7 +10,7 @@ The interaction model supports a continuous, "always-on" conversation with barge
 2.  **Audio Streaming**: When the user starts a conversation, the client continuously streams raw PCM audio to the server as binary messages.
 3.  **Server-Side Transcription**: The server uses Deepgram's streaming transcription. It detects pauses in the user's speech to identify the end of an utterance.
 4.  **Turn Handling**: When an utterance is finalized, the server sends the transcript to the AI for a response. The transcript accumulates if the user continues speaking before the AI responds.
-5.  **Barge-In (Interruption)**: If the user speaks while the AI is responding, the server cancels the in-progress AI/TTS task and processes the new user audio, creating a seamless barge-in experience.
+5.  **Barge-In (Interruption)**: If the user starts speaking while the AI is responding (detected via interim transcripts), the server immediately sends a `stop_audio_playback` message to halt client-side TTS playback. Complete utterances cancel the in-progress AI/TTS task on the server side.
 6.  **Response Streaming**: The server streams the AI's text and synthesized audio back to the client in real-time.
 7.  **End of Session**: The user can explicitly end the session, which sends a `user_audio_end` message and closes the connection.
 
@@ -61,7 +61,7 @@ The interaction model supports a continuous, "always-on" conversation with barge
 ### 5. Stop Audio Playback
 
 - **`type`**: `"stop_audio_playback"`
-- **When**: Sent during a barge-in to immediately halt client-side audio.
+- **When**: Sent during a barge-in to immediately halt client-side audio. Triggered when the user starts speaking (detected via interim transcripts) while the AI is still talking.
 
 ### 6. Error
 
