@@ -63,15 +63,23 @@ async def websocket_endpoint(client_websocket: WebSocket):
             try:
                 while True:
                     message = await client_websocket.receive()
+                    if message["type"] == "websocket.disconnect":
+                        print("Client disconnected. Closing Deepgram connection.")
+                        await dg_connection.finish()
+                        break
                     if message["type"] == "websocket.receive" and "bytes" in message:
                         await dg_connection.send(message["bytes"])
                     elif message["type"] == "websocket.receive" and "text" in message:
                         data = json.loads(message["text"])
                         if data.get("type") == "user_audio_end":
                             print("Client sent stop signal. Closing stream.")
+                            await dg_connection.finish()
                             break
+            except Exception as e:
+                print(f"Error forwarding audio: {e}")
             finally:
-                await dg_connection.finish()
+                if dg_connection:
+                    await dg_connection.finish()
 
         async def handle_transcripts():
             nonlocal ai_task

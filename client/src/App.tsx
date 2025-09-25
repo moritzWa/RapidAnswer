@@ -104,7 +104,9 @@ function App() {
           reason: event.reason,
           wasClean: event.wasClean,
         });
-        setRecordingState("idle");
+        // NOTE: We no longer set recording state to idle here.
+        // The conversation state is now managed explicitly by the user.
+        // setRecordingState("idle");
       },
       onError: (event) => {
         console.error("❌ WebSocket error:", event);
@@ -186,11 +188,9 @@ function App() {
             break;
 
           case "voice_response":
-            console.log("📄 Received voice_response, ensuring audio cleanup");
-            forceCleanupAudio();
-            setInterimMessage(null);
-            setStreamingResponse("");
+            console.log("📄 Received voice_response");
 
+            // Use the chat context from when recording started, not the current activeChat
             const targetChat =
               recordingChatRef.current || activeChatRef.current;
             if (targetChat) {

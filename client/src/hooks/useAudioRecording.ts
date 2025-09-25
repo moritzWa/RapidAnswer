@@ -1,5 +1,5 @@
-import { useCallback, useRef } from 'react';
-import { ReadyState } from 'react-use-websocket';
+import { useCallback, useRef } from "react";
+import { ReadyState } from "react-use-websocket";
 
 type RecordingState = "idle" | "recording" | "processing";
 
@@ -143,7 +143,7 @@ export function useAudioRecording({
       // Stop microphone stream to release red dot
       if (streamRef.current) {
         console.log("🔴 Stopping microphone stream");
-        streamRef.current.getTracks().forEach(track => track.stop());
+        streamRef.current.getTracks().forEach((track) => track.stop());
         streamRef.current = null;
       }
 
@@ -153,10 +153,13 @@ export function useAudioRecording({
         sendJsonMessage({ type: "user_audio_end" });
       }
 
-      console.log("⏳ Setting state to processing");
-      setRecordingState("processing");
+      console.log("✅ Setting state to idle");
+      setRecordingState("idle");
     } else {
-      console.log("⚠️  stopRecording called but not in recording state:", recordingState);
+      console.log(
+        "⚠️  stopRecording called but not in recording state:",
+        recordingState
+      );
     }
   }, [recordingState, readyState]);
 
@@ -178,7 +181,7 @@ export function useAudioRecording({
 
     if (streamRef.current) {
       console.log("🚨 Force stopping lingering stream");
-      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
     }
   }, []);
