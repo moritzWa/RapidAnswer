@@ -17,54 +17,61 @@ class ResponseModificationAnalysis(BaseModel):
     speed_multiplier: float  # 0.5 = slower, 1.0 = normal, 1.5 = faster, etc.
     explanation: str  # Brief explanation
 
-def clean_web_search_response(text: str) -> str:
-    """
-    Remove citations, URLs, and source references from web search responses
-    """
-    import re
-
-    # Remove markdown-style links [text](url)
-    text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
-
-    # Remove standalone URLs
-    text = re.sub(r'https?://[^\s\)]+', '', text)
-
-    # Remove citation patterns like ([source.com](url))
-    text = re.sub(r'\(\[([^\]]+)\]\([^\)]+\)\)', '', text)
-
-    # Remove standalone parenthetical citations like (source.com)
-    text = re.sub(r'\([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\)', '', text)
-
-    # Clean up extra whitespace and line breaks
-    text = re.sub(r'\n\s*\n', '\n', text)  # Multiple newlines to single
-    text = re.sub(r'\s+', ' ', text)       # Multiple spaces to single
-
-    return text.strip()
+# Note: clean_web_search_response function removed - not needed for Exa+Groq pipeline
 
 async def analyze_response_modifications(transcript: str) -> ResponseModificationAnalysis:
     """
     Analyze transcript for both web search needs and TTS speed modifications
     """
     try:
-        response = openai.beta.chat.completions.parse(
-            model="gpt-4.1-nano",
+        from groq import Groq
+
+        groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+        response = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",  # Latest fast model for analysis (1,800 tokens/sec)
             messages=[
                 {
                     "role": "system",
-                    "content": "Analyze user query for: 1) Need for web search (recent research, opinions of experts, live data, current events) 2) Speech speed changes ('slower', 'faster', 'repeat slower'). Return needs_web_search=true for time-sensitive queries. Speed: 0.5=slower, 1.0=normal, 1.5+=faster. Brief explanation."
+                    "content": """Analyze the user query and respond with ONLY a JSON object (no other text):
+{
+  "needs_web_search": boolean,
+  "has_speed_request": boolean,
+  "speed_multiplier": number,
+  "explanation": "brief explanation"
+}
+
+Rules:
+- needs_web_search: true for recent research, current events, live data, expert opinions
+- has_speed_request: true if user mentions "slower", "faster", "speed up", "slow down"
+- speed_multiplier: 0.5 for slower, 1.0 for normal, 1.5+ for faster, 2.0 for default
+- explanation: 1-5 words max"""
                 },
                 {
                     "role": "user",
                     "content": transcript
                 }
             ],
-            response_format=ResponseModificationAnalysis,
+            temperature=0.1,  # Low temperature for consistent JSON
+            max_tokens=200
         )
 
-        print(f"🔍🎛️ Response analysis: search={response.choices[0].message.parsed.needs_web_search}, speed={response.choices[0].message.parsed.speed_multiplier:.1f}x")
-        return response.choices[0].message.parsed
+        # Parse the JSON response
+        import json
+        result_json = json.loads(response.choices[0].message.content)
+
+        analysis_result = ResponseModificationAnalysis(
+            needs_web_search=result_json["needs_web_search"],
+            has_speed_request=result_json["has_speed_request"],
+            speed_multiplier=result_json["speed_multiplier"],
+            explanation=result_json["explanation"]
+        )
+
+        print(f"🔍🎛️ Groq analysis: search={analysis_result.needs_web_search}, speed={analysis_result.speed_multiplier:.1f}x")
+        return analysis_result
+
     except Exception as e:
-        print(f"⚠️ Response modification analysis failed: {e}")
+        print(f"⚠️ Groq analysis failed: {e}")
         return ResponseModificationAnalysis(
             needs_web_search=False,
             has_speed_request=False,
@@ -131,56 +138,11 @@ async def stream_openai_response(text: str, websocket: WebSocket, sentence_handl
         use_search = use_web_search
 
     if use_search:
-        print(f"🔍 Using Responses API with web search for query: '{text}'")
-        # Use Responses API for web search with chat history context
-        client = openai.OpenAI()
+        print(f"🔍⚡ Using fast search (Exa + Groq) for query: '{text}'")
+        # Use fast search pipeline with Exa + Groq
+        from fast_search import fast_search_and_respond
 
-        # Build context with chat history
-        context_parts = [system_message]
-        if chat_history:
-            context_parts.append("\nPrevious conversation:")
-            for msg in chat_history:  # Include all messages for context
-                role = "User" if msg["role"] == "user" else "Assistant"
-                context_parts.append(f"{role}: {msg['content']}")
-        context_parts.append(f"\nUser: {user_message}")
-
-        response = client.responses.create(
-            model="gpt-4o",
-            tools=[{"type": "web_search_preview"}],
-            input="\n".join(context_parts)
-        )
-
-        # Process response, clean citations, and simulate streaming for compatibility
-        full_response = clean_web_search_response(response.output_text)
-        sentence_buffer = ""
-
-        # Send response in chunks to simulate streaming
-        for char in full_response:
-            sentence_buffer += char
-
-            # Send chunk
-            stream_response = {
-                "type": "ai_response_stream",
-                "content": char,
-                "is_complete": False
-            }
-            await websocket.send_text(json.dumps(stream_response))
-
-            # Check for sentence boundaries
-            if char in ['.', '!', '?'] and len(sentence_buffer.strip()) > 5:
-                complete_sentence = sentence_buffer.strip()
-                await sentence_handler(complete_sentence)
-                sentence_buffer = ""
-
-        # Send completion signal
-        completion_response = {
-            "type": "ai_response_stream",
-            "content": "",
-            "is_complete": True
-        }
-        await websocket.send_text(json.dumps(completion_response))
-
-        return full_response, sentence_buffer
+        return await fast_search_and_respond(user_message, chat_history, websocket, sentence_handler)
     else:
         # Use regular Chat Completions for non-search queries with chat history
         model = "gpt-4o-mini"
