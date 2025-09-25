@@ -2,7 +2,11 @@
 
 ChatGPT voice mode but on steroids.
 
-RapidAnswer leverages Groq for extremely low-latency AI responses (sub-millisecond latency for the first token and up to 8.5x more tokens per second than OpenAI's GPT-4.1 Nano) and Exa Search for fast, in-depth web knowledge retrieval. This combination allows the application to answer complex questions with greater speed and research depth than typical AI voice chat applications.
+RapidAnswer leverages Groq for extremely low-latency AI responses (sub-millisecond latency for the first token and up to 8.5x more tokens per second than OpenAI's GPT-4.1 Nano) and Exa Search for fast, in-depth web knowledge retrieval. This combination allows the application to answer complex questions with greater speed and research depth than typical AI voice chat applications (Grok, ChatGPT, Perplexity, etc.).
+
+Click the image for a demo:
+
+[![Loom video thumbnail](./loom-preview.png)](https://www.loom.com/share/37f813a0560d4fa2a205d7cc5acb9e42)
 
 ## Project Structure
 
