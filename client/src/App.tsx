@@ -209,6 +209,8 @@ function App() {
               });
             }
             setRecordingChat(null);
+            // Clear interim message when final response arrives
+            setInterimMessage(null);
             // No longer set recording state to idle here; it's controlled by the toggle button
             // console.log("✅ Setting state to idle");
             // setRecordingState("idle");

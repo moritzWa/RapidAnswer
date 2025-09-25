@@ -35,7 +35,7 @@ async def manage_audio_queue(audio_queue: asyncio.Queue, websocket: WebSocket):
         print("🏁 Audio queue manager stopped")
 
 
-async def get_ai_response_with_sentence_streaming(text: str, websocket: WebSocket) -> str:
+async def get_ai_response_with_sentence_streaming(text: str, websocket: WebSocket, chat_history: list, tts_speed: float = 2.0, use_web_search: bool = False) -> str:
     """
     Get AI response from OpenAI API with sentence-by-sentence TTS streaming
     """
@@ -64,7 +64,8 @@ async def get_ai_response_with_sentence_streaming(text: str, websocket: WebSocke
             text=sentence,
             audio_queue=audio_queue,
             wait_for_event=previous_sentence_done,
-            set_event_when_done=current_sentence_done
+            set_event_when_done=current_sentence_done,
+            speed=tts_speed
         ))
         tts_tasks.append(task)
 
@@ -73,7 +74,7 @@ async def get_ai_response_with_sentence_streaming(text: str, websocket: WebSocke
 
     try:
         # Stream response and handle sentences
-        full_response, remaining_buffer = await stream_openai_response(text, websocket, handle_sentence)
+        full_response, remaining_buffer = await stream_openai_response(text, websocket, handle_sentence, chat_history, use_web_search)
 
         # Handle any remaining text in buffer
         if remaining_buffer.strip():
@@ -101,7 +102,8 @@ async def synthesize_speech_streaming(
     text: str,
     audio_queue: asyncio.Queue,
     wait_for_event: asyncio.Event,
-    set_event_when_done: asyncio.Event
+    set_event_when_done: asyncio.Event,
+    speed: float = 2.0
 ) -> None:
     """
     Convert text to speech using OpenAI's streaming TTS API and put chunks in a queue,
@@ -113,7 +115,7 @@ async def synthesize_speech_streaming(
             model="tts-1",
             voice="alloy",
             input=text,
-            speed=2.0,  # 2x speed as requested
+            speed=speed,  # Dynamic speed based on user request
             response_format="pcm"  # Raw PCM for lowest latency
         ) as response:
             await wait_for_event.wait()

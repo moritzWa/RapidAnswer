@@ -39,6 +39,7 @@ async def websocket_endpoint(client_websocket: WebSocket):
     print("WebSocket connection established")
 
     ai_task = None
+    chat_history = []  # Store conversation history for this connection
     
     try:
         config = DeepgramClientOptions(options={"keepalive": "true"})
@@ -55,7 +56,10 @@ async def websocket_endpoint(client_websocket: WebSocket):
             channels=1,
             sample_rate=16000,
             smart_format=True,
-            endpointing=1000,
+            interim_results=True,  # Required for utterance_end_ms
+            endpointing=1200,  # Balance: 1.2s to allow complete thoughts
+            utterance_end_ms=2500,  # Longer backup for complete utterances
+            no_delay=True,  # Fix for speech_final not triggering
         )
         await dg_connection.start(options)
 
@@ -82,41 +86,31 @@ async def websocket_endpoint(client_websocket: WebSocket):
                     await dg_connection.finish()
 
         async def handle_transcripts():
-            nonlocal ai_task
-            full_transcript = ""
-            turn_timer = None
+            nonlocal ai_task, chat_history
 
-            async def reset_turn_timer():
-                nonlocal turn_timer
-                if turn_timer:
-                    turn_timer.cancel()
-                turn_timer = asyncio.create_task(asyncio.sleep(0.5)) # 500ms timer
-                return turn_timer
+            async for complete_transcript in transcript_generator:
+                # transcript_generator now only yields when speech_final=True
+                print(f"User finished speaking. Complete transcript: '{complete_transcript}'")
 
-            async for transcript_part in transcript_generator:
-                full_transcript += transcript_part + " "
-                
-                timer_task = await reset_turn_timer()
-
+                # Cancel any ongoing AI response (barge-in)
                 if ai_task and not ai_task.done():
                     print("Barge-in detected. Cancelling previous AI response.")
                     ai_task.cancel()
                     await client_websocket.send_text(json.dumps({"type": "stop_audio_playback"}))
 
-                try:
-                    await timer_task # Wait for the timer to complete
-                    # If the timer completes without being cancelled, the user has paused.
-                    print(f"User paused. Full transcript: '{full_transcript.strip()}'")
-                    ai_task = asyncio.create_task(handle_ai_response(full_transcript.strip(), client_websocket))
-                    
-                    # Wait for AI task to complete and check if it was successful
-                    if await ai_task:
-                         full_transcript = "" # Reset for the next turn only on success
+                # Start AI response immediately (no additional timer needed)
+                ai_task = asyncio.create_task(handle_ai_response(complete_transcript, client_websocket, chat_history))
 
-                except asyncio.CancelledError:
-                    # Timer was reset, continue accumulating transcript
-                    print("Timer reset. Continuing to accumulate transcript.")
-                    continue
+                # Wait for AI task to complete and update chat history
+                ai_response = await ai_task
+                if ai_response:
+                    # Update chat history with this successful exchange
+                    chat_history.append({"role": "user", "content": complete_transcript})
+                    chat_history.append({"role": "assistant", "content": ai_response})
+
+                    # Keep history manageable (last 10 exchanges = 20 messages)
+                    if len(chat_history) > 20:
+                        chat_history = chat_history[-20:]
 
         await asyncio.gather(forward_audio(), handle_transcripts())
 
