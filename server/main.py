@@ -108,9 +108,7 @@ async def websocket_endpoint(client_websocket: WebSocket):
                     chat_history.append({"role": "user", "content": complete_transcript})
                     chat_history.append({"role": "assistant", "content": ai_response})
 
-                    # Keep history manageable (last 10 exchanges = 20 messages)
-                    if len(chat_history) > 20:
-                        chat_history = chat_history[-20:]
+                    # No message limit - keep full conversation history
 
         await asyncio.gather(forward_audio(), handle_transcripts())
 

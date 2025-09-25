@@ -139,7 +139,7 @@ async def stream_openai_response(text: str, websocket: WebSocket, sentence_handl
         context_parts = [system_message]
         if chat_history:
             context_parts.append("\nPrevious conversation:")
-            for msg in chat_history[-6:]:  # Include last 6 messages for context
+            for msg in chat_history:  # Include all messages for context
                 role = "User" if msg["role"] == "user" else "Assistant"
                 context_parts.append(f"{role}: {msg['content']}")
         context_parts.append(f"\nUser: {user_message}")
@@ -188,9 +188,9 @@ async def stream_openai_response(text: str, websocket: WebSocket, sentence_handl
         # Build messages with chat history
         messages = [{"role": "system", "content": system_message}]
 
-        # Include recent chat history for context
+        # Include full chat history for context
         if chat_history:
-            messages.extend(chat_history[-10:])  # Include last 10 messages
+            messages.extend(chat_history)  # Include all messages
 
         messages.append({"role": "user", "content": user_message})
 
